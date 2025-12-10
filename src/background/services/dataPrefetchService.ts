@@ -86,9 +86,13 @@ export async function prefetchCommonData(
       
       try {
         const categories = await fetchCategories(25);
-        console.log(`%c[Prefetch] ✅ Categories cached (${categories.length} categories)`, 'color: #10b981; font-weight: bold;');
+        if (categories.length > 0) {
+          console.log(`%c[Prefetch] ✅ Categories cached (${categories.length} categories)`, 'color: #10b981; font-weight: bold;');
+        } else {
+          console.warn('[Prefetch] ⚠️ No categories fetched (session may not be established yet - this is normal)');
+        }
       } catch (error) {
-        console.error('[Prefetch] ❌ Error fetching categories:', error);
+        console.warn('[Prefetch] ⚠️ Error fetching categories (non-critical):', error);
       }
       
       currentStep++;

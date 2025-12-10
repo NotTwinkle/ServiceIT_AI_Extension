@@ -25,6 +25,7 @@ import {
   IvantiDepartment,
   IvantiServiceRequest
 } from './ivantiDataService';
+import { fetchRoles, IvantiRole } from './rolesService';
 import { IVANTI_CONFIG } from '../config';
 
 export interface KnowledgeBase {
@@ -35,12 +36,13 @@ export interface KnowledgeBase {
   services: IvantiService[];
   teams: IvantiTeam[];
   departments: IvantiDepartment[];
+  roles: IvantiRole[];
   userTickets: IvantiTicket[];
   lastUpdated: number;
   version: number;
 }
 
-const KB_VERSION = 3; // Incremented to include service requests
+const KB_VERSION = 4; // Incremented to include roles
 const KB_STORAGE_KEY = 'ivanti_knowledge_base';
 
 /**
@@ -87,12 +89,13 @@ export async function buildKnowledgeBase(
     services: [],
     teams: [],
     departments: [],
+    roles: [],
     userTickets: [],
     lastUpdated: Date.now(),
     version: KB_VERSION
   };
   
-  const totalSteps = 8; // Updated for new data types (including service requests)
+  const totalSteps = 9; // Updated to include roles
   let currentStep = 0;
   
   try {
@@ -352,9 +355,13 @@ export async function buildKnowledgeBase(
     try {
       console.log('%c[KnowledgeBase] 📥 Fetching categories...', 'color: #3b82f6; font-weight: bold;');
       kb.categories = await fetchCategories(100); // Get up to 100 categories
-      console.log(`%c[KnowledgeBase] ✅ Loaded ${kb.categories.length} categories`, 'color: #10b981; font-weight: bold;');
+      if (kb.categories.length > 0) {
+        console.log(`%c[KnowledgeBase] ✅ Loaded ${kb.categories.length} categories`, 'color: #10b981; font-weight: bold;');
+      } else {
+        console.warn('[KnowledgeBase] ⚠️ No categories loaded (session may not be established - this is normal after logout/login)');
+      }
     } catch (error) {
-      console.error('[KnowledgeBase] ❌ Error fetching categories:', error);
+      console.warn('[KnowledgeBase] ⚠️ Error fetching categories (non-critical):', error);
     }
     
     currentStep++;
@@ -412,6 +419,11 @@ export async function buildKnowledgeBase(
     try {
       console.log('%c[KnowledgeBase] 📥 Fetching service requests...', 'color: #3b82f6; font-weight: bold;');
       const rawServiceReqs = await fetchServiceRequests(100);
+      
+      if (rawServiceReqs.length === 0) {
+        console.warn('[KnowledgeBase] ⚠️ No service requests loaded (session may not be established - this is normal after logout/login)');
+      }
+      
       // Normalize and add human-readable created date
       kb.serviceRequests = rawServiceReqs.map((sr: any) => {
         let humanCreated = '';
@@ -438,12 +450,27 @@ export async function buildKnowledgeBase(
       });
       console.log(`%c[KnowledgeBase] ✅ Loaded ${kb.serviceRequests.length} service requests`, 'color: #10b981; font-weight: bold;');
     } catch (error) {
-      console.error('[KnowledgeBase] ❌ Error fetching service requests:', error);
+      console.warn('[KnowledgeBase] ⚠️ Error fetching service requests (non-critical):', error);
     }
 
     currentStep++;
     
-    // Step 8: Fetch current user's tickets
+    // Step 8: Fetch roles
+    if (onProgress) {
+      onProgress('roles', Math.round((currentStep / totalSteps) * 100), 'Loading roles...');
+    }
+    
+    try {
+      console.log('%c[KnowledgeBase] 📥 Fetching roles...', 'color: #3b82f6; font-weight: bold;');
+      kb.roles = await fetchRoles();
+      console.log(`%c[KnowledgeBase] ✅ Loaded ${kb.roles.length} roles`, 'color: #10b981; font-weight: bold;');
+    } catch (error) {
+      console.error('[KnowledgeBase] ❌ Error fetching roles:', error);
+    }
+    
+    currentStep++;
+    
+    // Step 9: Fetch current user's tickets
     if (currentUser?.recId) {
       if (onProgress) {
         onProgress('user_tickets', Math.round((currentStep / totalSteps) * 100), 'Loading your tickets...');
@@ -494,6 +521,7 @@ export async function buildKnowledgeBase(
       services: kb.services.length,
       teams: kb.teams.length,
       departments: kb.departments.length,
+      roles: kb.roles.length,
       userTickets: kb.userTickets.length,
       totalSize: `${(JSON.stringify(kb).length / 1024).toFixed(2)} KB`
     });
@@ -523,6 +551,19 @@ export async function getKnowledgeBaseContext(query: string, currentUser?: Ivant
   const lowerQuery = query.toLowerCase();
   const context: string[] = [];
   
+  // Add Ivanti official documentation (CRITICAL: AI must reference this)
+  try {
+    const { getRelevantDocumentation, formatDocumentationForContext } = await import('./ivantiDocumentation');
+    const relevantDocs = getRelevantDocumentation(query);
+    const docContext = formatDocumentationForContext(relevantDocs);
+    if (docContext) {
+      context.push(docContext);
+      context.push(`\n[CRITICAL INSTRUCTION]: The documentation above is OFFICIAL IVANTI DOCUMENTATION. When answering questions, ALWAYS reference this documentation first. If the user asks about how something works in Ivanti, use the documentation above. Only use the knowledge base data below for specific records (incidents, employees, etc.) from this organization.`);
+    }
+  } catch (error) {
+    console.warn('[KnowledgeBase] Could not load Ivanti documentation:', error);
+  }
+  
   // Add current user info if available
   if (currentUser) {
     context.push(`CURRENT USER: ${currentUser.fullName} (${currentUser.loginId}), Team: ${currentUser.team || 'Unknown'}, Role: ${currentUser.roles?.join(', ') || 'Standard User'}`);
@@ -546,52 +587,130 @@ export async function getKnowledgeBaseContext(query: string, currentUser?: Ivant
   context.push(`- ${kb.services.length} services`);
   context.push(`- ${kb.teams.length} teams`);
   context.push(`- ${kb.departments.length} departments`);
+  context.push(`- ${kb.roles.length} roles`);
+  
+  // SECURITY: Only include employee data if user has permission to view all users
+  const canViewEmployees = currentUser?.capabilities?.canViewAllUsers ?? false;
   
   // If query is about users/employees OR recent conversation mentioned users
-  if (lowerQuery.includes('user') || lowerQuery.includes('employee') || lowerQuery.includes('find') || 
-      combinedContext.includes('user') || combinedContext.includes('employee') || combinedContext.includes('find')) {
-    context.push(`\n[EMPLOYEES IN SYSTEM - ${kb.employees.length} total]:`);
-    if (kb.employees.length > 0) {
-      // Try to extract name from query for targeted search
-      const nameMatch = query.match(/(?:find|search|know|get|show|who is|about)\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)/i);
-      const searchName = nameMatch ? nameMatch[1].toLowerCase().trim() : null;
-      
-      let employeesToShow = kb.employees;
-      let showingFiltered = false;
-      
-      // If searching for a specific name, prioritize matching employees
-      if (searchName) {
-        const matches = kb.employees.filter(e => 
-          e.DisplayName?.toLowerCase().includes(searchName) ||
-          e.LoginID?.toLowerCase().includes(searchName) ||
-          e.PrimaryEmail?.toLowerCase().includes(searchName)
-        );
+  if ((lowerQuery.includes('user') || lowerQuery.includes('employee') || lowerQuery.includes('find') || 
+      combinedContext.includes('user') || combinedContext.includes('employee') || combinedContext.includes('find'))) {
+    
+    if (!canViewEmployees) {
+      // Self Service users cannot search employees
+      context.push(`\n[EMPLOYEES]: Access restricted. You can only view your own profile information.`);
+    } else {
+      context.push(`\n[EMPLOYEES IN SYSTEM - ${kb.employees.length} total]:`);
+      if (kb.employees.length > 0) {
+        // Try to extract name from query for targeted search
+        const nameMatch = query.match(/(?:find|search|know|get|show|who is|about)\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)/i);
+        const searchName = nameMatch ? nameMatch[1].toLowerCase().trim() : null;
         
-        if (matches.length > 0) {
-          employeesToShow = [...matches, ...kb.employees.filter(e => !matches.includes(e))];
-          showingFiltered = true;
-          context.push(`[FOUND ${matches.length} MATCHING EMPLOYEE(S) FOR "${searchName}"]:`);
+        let employeesToShow = kb.employees;
+        let showingFiltered = false;
+        
+        // If searching for a specific name, prioritize matching employees
+        if (searchName) {
+          const matches = kb.employees.filter(e => 
+            e.DisplayName?.toLowerCase().includes(searchName) ||
+            e.LoginID?.toLowerCase().includes(searchName) ||
+            e.PrimaryEmail?.toLowerCase().includes(searchName)
+          );
+          
+          if (matches.length > 0) {
+            employeesToShow = [...matches, ...kb.employees.filter(e => !matches.includes(e))];
+            showingFiltered = true;
+            context.push(`[FOUND ${matches.length} MATCHING EMPLOYEE(S) FOR "${searchName}"]:`);
+          }
         }
-      }
-      
-      // Show up to 150 employees (much higher limit to ensure all common names are included)
-      const sample = employeesToShow.slice(0, 150);
-      context.push(sample.map((e, i) => 
-        `${i + 1}. ${e.DisplayName} (${e.PrimaryEmail || e.LoginID}) - ${e.Team || 'No team'} - ${e.Status}`
-      ).join('\n'));
-      if (kb.employees.length > 150) {
-        context.push(`... and ${kb.employees.length - 150} more employees in the system.`);
-      }
-      
-      if (searchName && showingFiltered) {
-        context.push(`\n[NOTE]: Top results are employees matching "${searchName}".`);
+        
+        // Show up to 150 employees (much higher limit to ensure all common names are included)
+        const sample = employeesToShow.slice(0, 150);
+        context.push(sample.map((e, i) => 
+          `${i + 1}. ${e.DisplayName} (${e.PrimaryEmail || e.LoginID}) - ${e.Team || 'No team'} - ${e.Status}`
+        ).join('\n'));
+        if (kb.employees.length > 150) {
+          context.push(`... and ${kb.employees.length - 150} more employees in the system.`);
+        }
+        
+        if (searchName && showingFiltered) {
+          context.push(`\n[NOTE]: Top results are employees matching "${searchName}".`);
+        }
       }
     }
   }
   
-  // If query is about incidents/tickets
-  if (lowerQuery.includes('incident') || lowerQuery.includes('ticket') || 
-      combinedContext.includes('incident') || combinedContext.includes('ticket')) {
+  // SECURITY: Check if user can view all tickets
+  const canViewAllTickets = currentUser?.capabilities?.canViewAllTickets ?? false;
+  
+  // Determine if user wants ALL tickets (incidents + service requests) or specific types
+  const wantsAllTickets = (lowerQuery.includes('ticket') || combinedContext.includes('ticket')) &&
+                          !lowerQuery.includes('incident') &&
+                          !lowerQuery.includes('service request') &&
+                          !lowerQuery.includes('sr ') &&
+                          !lowerQuery.includes('sr#');
+  
+  // If user wants ALL tickets (generic "tickets"), show combined view
+  if (wantsAllTickets) {
+    if (!canViewAllTickets) {
+      // Self Service users can only see their own tickets
+      context.push(`\n[TICKETS]: You can only view your own tickets. Use "my tickets" to see tickets you created.`);
+    } else {
+      context.push(`\n[ALL TICKETS IN SYSTEM]:`);
+      context.push(`Note: In Ivanti, "tickets" includes both Incidents and Service Requests.`);
+      context.push(`- ${kb.incidents.length} Incidents`);
+      context.push(`- ${kb.serviceRequests.length} Service Requests`);
+      context.push(`- Total: ${kb.incidents.length + kb.serviceRequests.length} tickets\n`);
+      
+      // Combine and sort by CreatedDateTime
+      const allTickets: any[] = [
+        ...kb.incidents.map(inc => ({
+          type: 'Incident',
+          number: inc.IncidentNumber,
+          subject: inc.Subject,
+          status: inc.Status,
+          priority: inc.Priority,
+          reporter: inc.ProfileFullName,
+          created: inc.CreatedDateTime,
+          humanCreated: inc.HumanCreatedDateTime,
+        })),
+        ...kb.serviceRequests.map((sr: any) => ({
+          type: 'Service Request',
+          number: sr.RequestNumber || sr.ServiceReqNumber,
+          subject: sr.Subject,
+          status: sr.Status,
+          priority: sr.Urgency || 'N/A',
+          reporter: sr.ProfileFullName,
+          created: sr.CreatedDateTime,
+          humanCreated: sr.HumanCreatedDateTime,
+        }))
+      ];
+      
+      // Sort by created date (most recent first)
+      allTickets.sort((a, b) => {
+        const dateA = a.created ? new Date(a.created).getTime() : 0;
+        const dateB = b.created ? new Date(b.created).getTime() : 0;
+        return dateB - dateA; // descending
+      });
+      
+      if (allTickets.length > 0) {
+        context.push(`[RECENT TICKETS (Combined Incidents & Service Requests) - ${allTickets.length} total]:`);
+        const sample = allTickets.slice(0, 20);
+        context.push(sample.map((t, i) => 
+          `${i + 1}. ${t.type} #${t.number}: "${t.subject}" - ${t.status} - Priority/Urgency: ${t.priority} - Reporter: ${t.reporter || 'Unknown'} - Created: ${t.humanCreated || t.created || 'Unknown'}`
+        ).join('\n'));
+        if (allTickets.length > 20) {
+          context.push(`... and ${allTickets.length - 20} more tickets in the system.`);
+        }
+      }
+    }
+  }
+  
+  // If query is about incidents/tickets (but NOT generic "tickets" which we already handled above)
+  if ((lowerQuery.includes('incident') || 
+      (lowerQuery.includes('ticket') && !wantsAllTickets) ||
+      combinedContext.includes('incident') || 
+      (combinedContext.includes('ticket') && !wantsAllTickets)) && !wantsAllTickets) {
     // Try to detect a specific date in the query (e.g., "december 1", "2025-12-01")
     let dateFilter: string | null = null;
     const monthNames = ['january','february','march','april','may','june','july','august','september','october','november','december'];
@@ -627,17 +746,33 @@ export async function getKnowledgeBaseContext(query: string, currentUser?: Ivant
     }
 
     if (dateFilter) {
-      // Filter incidents by CreatedDateTime date prefix
-      const byDate = kb.incidents.filter(t => 
-        t.CreatedDateTime && String(t.CreatedDateTime).startsWith(dateFilter!)
-      );
-      context.push(`\n[INCIDENTS CREATED ON ${dateFilter} - ${byDate.length} incident(s)]:`);
-      if (byDate.length > 0) {
-        context.push(byDate.slice(0, 25).map((t, i) =>
-          `${i + 1}. Incident #${t.IncidentNumber}: "${t.Subject}" - ${t.Status} - Priority ${t.Priority} - Reporter: ${t.ProfileFullName || 'Unknown'} - Created: ${t.HumanCreatedDateTime || t.CreatedDateTime || 'Unknown'}`
-        ).join('\n'));
+      // SECURITY: Only show all incidents if user has permission
+      if (canViewAllTickets) {
+        // Filter incidents by CreatedDateTime date prefix
+        const byDate = kb.incidents.filter(t => 
+          t.CreatedDateTime && String(t.CreatedDateTime).startsWith(dateFilter!)
+        );
+        context.push(`\n[INCIDENTS CREATED ON ${dateFilter} - ${byDate.length} incident(s)]:`);
+        if (byDate.length > 0) {
+          context.push(byDate.slice(0, 25).map((t, i) =>
+            `${i + 1}. Incident #${t.IncidentNumber}: "${t.Subject}" - ${t.Status} - Priority ${t.Priority} - Reporter: ${t.ProfileFullName || 'Unknown'} - Created: ${t.HumanCreatedDateTime || t.CreatedDateTime || 'Unknown'}`
+          ).join('\n'));
+        } else {
+          context.push(`No incidents were found with CreatedDateTime on ${dateFilter}.`);
+        }
       } else {
-        context.push(`No incidents were found with CreatedDateTime on ${dateFilter}.`);
+        // Self Service users can only see their own tickets
+        const userTicketsOnDate = kb.userTickets.filter(t => 
+          t.CreatedDateTime && String(t.CreatedDateTime).startsWith(dateFilter!)
+        );
+        if (userTicketsOnDate.length > 0) {
+          context.push(`\n[YOUR INCIDENTS CREATED ON ${dateFilter} - ${userTicketsOnDate.length} incident(s)]:`);
+          context.push(userTicketsOnDate.slice(0, 25).map((t, i) =>
+            `${i + 1}. Incident #${t.IncidentNumber}: "${t.Subject}" - ${t.Status} - Priority ${t.Priority} - Created: ${t.HumanCreatedDateTime || t.CreatedDateTime || 'Unknown'}`
+          ).join('\n'));
+        } else {
+          context.push(`\n[INCIDENTS ON ${dateFilter}]: You don't have any tickets created on this date.`);
+        }
       }
       } else {
         // If the user mentioned a month without a specific day (e.g., "in december"),
@@ -665,28 +800,53 @@ export async function getKnowledgeBaseContext(query: string, currentUser?: Ivant
           });
 
           const monthLabel = monthNames[monthOnlyIndex][0].toUpperCase() + monthNames[monthOnlyIndex].slice(1);
-          context.push(`\n[INCIDENTS CREATED IN ${monthLabel} ${year} - ${incidentsInMonth.length} incident(s)]:`);
-          if (incidentsInMonth.length > 0) {
-            context.push(incidentsInMonth.slice(0, 50).map((t, i) =>
-              `${i + 1}. Incident #${t.IncidentNumber}: "${t.Subject}" - ${t.Status} - Priority ${t.Priority} - Reporter: ${t.ProfileFullName || 'Unknown'} - Created: ${t.HumanCreatedDateTime || t.CreatedDateTime || 'Unknown'}`
-            ).join('\n'));
-            if (incidentsInMonth.length > 50) {
-              context.push(`... and ${incidentsInMonth.length - 50} more incidents in that month.`);
+          
+          // SECURITY: Only show all incidents if user has permission
+          if (canViewAllTickets) {
+            context.push(`\n[INCIDENTS CREATED IN ${monthLabel} ${year} - ${incidentsInMonth.length} incident(s)]:`);
+            if (incidentsInMonth.length > 0) {
+              context.push(incidentsInMonth.slice(0, 50).map((t, i) =>
+                `${i + 1}. Incident #${t.IncidentNumber}: "${t.Subject}" - ${t.Status} - Priority ${t.Priority} - Reporter: ${t.ProfileFullName || 'Unknown'} - Created: ${t.HumanCreatedDateTime || t.CreatedDateTime || 'Unknown'}`
+              ).join('\n'));
+              if (incidentsInMonth.length > 50) {
+                context.push(`... and ${incidentsInMonth.length - 50} more incidents in that month.`);
+              }
+            } else {
+              context.push(`No incidents were found with CreatedDateTime in ${monthLabel} ${year}.`);
             }
           } else {
-            context.push(`No incidents were found with CreatedDateTime in ${monthLabel} ${year}.`);
+            // Self Service users can only see their own tickets
+            const userTicketsInMonth = kb.userTickets.filter(t => {
+              if (!t.CreatedDateTime) return false;
+              const d = new Date(t.CreatedDateTime);
+              return d.getMonth() === monthOnlyIndex && d.getFullYear() === year;
+            });
+            
+            if (userTicketsInMonth.length > 0) {
+              context.push(`\n[YOUR INCIDENTS CREATED IN ${monthLabel} ${year} - ${userTicketsInMonth.length} incident(s)]:`);
+              context.push(userTicketsInMonth.slice(0, 50).map((t, i) =>
+                `${i + 1}. Incident #${t.IncidentNumber}: "${t.Subject}" - ${t.Status} - Priority ${t.Priority} - Created: ${t.HumanCreatedDateTime || t.CreatedDateTime || 'Unknown'}`
+              ).join('\n'));
+            } else {
+              context.push(`\n[INCIDENTS IN ${monthLabel} ${year}]: You don't have any tickets created in this month.`);
+            }
           }
         } else {
           // Default: show recent incidents (always include created date so the AI can't claim dates are missing)
-          context.push(`\n[RECENT INCIDENTS IN SYSTEM - ${kb.incidents.length} total]:`);
-          if (kb.incidents.length > 0) {
-            const sample = kb.incidents.slice(0, 10);
-            context.push(sample.map((t, i) => 
-              `${i + 1}. Incident #${t.IncidentNumber}: "${t.Subject}" - ${t.Status} - Priority ${t.Priority} - ${t.ProfileFullName || 'Unknown'} - Created: ${t.HumanCreatedDateTime || t.CreatedDateTime || 'Unknown'}`
-            ).join('\n'));
-            if (kb.incidents.length > 10) {
-              context.push(`... and ${kb.incidents.length - 10} more incidents in the system.`);
+          // SECURITY: Only show all incidents if user has permission
+          if (canViewAllTickets) {
+            context.push(`\n[RECENT INCIDENTS IN SYSTEM - ${kb.incidents.length} total]:`);
+            if (kb.incidents.length > 0) {
+              const sample = kb.incidents.slice(0, 10);
+              context.push(sample.map((t, i) => 
+                `${i + 1}. Incident #${t.IncidentNumber}: "${t.Subject}" - ${t.Status} - Priority ${t.Priority} - ${t.ProfileFullName || 'Unknown'} - Created: ${t.HumanCreatedDateTime || t.CreatedDateTime || 'Unknown'}`
+              ).join('\n'));
+              if (kb.incidents.length > 10) {
+                context.push(`... and ${kb.incidents.length - 10} more incidents in the system.`);
+              }
             }
+          } else {
+            context.push(`\n[INCIDENTS]: You can only view your own tickets. Use "my tickets" to see tickets you created.`);
           }
         }
       }
@@ -844,7 +1004,28 @@ export async function getKnowledgeBaseContext(query: string, currentUser?: Ivant
   }
   
   context.push(`\n[KNOWLEDGE BASE INFO]: This data was last updated ${Math.round((Date.now() - kb.lastUpdated) / 1000)} seconds ago.`);
-  context.push(`\n[CRITICAL INSTRUCTION]: You have FULL access to this knowledge base data. When users ask about services, employees, incidents, categories, teams, or departments, you MUST use the data from this knowledge base. Do NOT say "I don't have that information" if it's in the knowledge base above.`);
+  // SECURITY: Add role-based restrictions to AI instructions
+  if (currentUser?.capabilities) {
+    const caps = currentUser.capabilities;
+    context.push(`\n[SECURITY RESTRICTIONS - STRICTLY ENFORCE]:`);
+    
+    if (!caps.canViewAllUsers) {
+      context.push(`- User CANNOT search for or view other employees/users. Only show their own profile if asked.`);
+    }
+    
+    if (!caps.canViewAllTickets) {
+      context.push(`- User CANNOT view all tickets. Only show their own tickets (from [YOUR TICKETS] section above).`);
+      context.push(`- If user asks for "all tickets" or "all incidents", redirect them to use "my tickets" instead.`);
+    }
+    
+    if (!caps.canEditAllTickets && !caps.canCloseTickets) {
+      context.push(`- User CANNOT edit, update, assign, or close tickets. They can only CREATE new tickets.`);
+    }
+    
+    context.push(`- User CAN create new tickets (this is allowed for all users).`);
+  }
+  
+  context.push(`\n[CRITICAL INSTRUCTION]: Use ONLY the data provided in this knowledge base context. Respect the security restrictions above. When users ask about services, categories, teams, or departments, you MUST use the data from this knowledge base. Do NOT say "I don't have that information" if it's in the knowledge base above.`);
   context.push(`If a user asks for "one with detail" or "give me one", provide the FULL details from the knowledge base, including Name, Description, Owner, Status, etc.`);
   
   return context.join('\n');

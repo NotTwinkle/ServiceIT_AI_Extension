@@ -47,32 +47,51 @@ export async function fetchRoles(): Promise<IvantiRole[]> {
   try {
     console.log('[RolesService] 📥 Fetching roles from Ivanti...');
     
-    const url = `${IVANTI_CONFIG.baseUrl}${IVANTI_CONFIG.endpoints.roles}?$top=500`;
+    // Try multiple approaches - some Ivanti versions don't support $top or have limits
+    const urls = [
+      `${IVANTI_CONFIG.baseUrl}${IVANTI_CONFIG.endpoints.roles}?$select=RecId,RoleID,DisplayName,DesktopName`,
+      `${IVANTI_CONFIG.baseUrl}${IVANTI_CONFIG.endpoints.roles}?$top=100&$select=RecId,RoleID,DisplayName,DesktopName`,
+      `${IVANTI_CONFIG.baseUrl}${IVANTI_CONFIG.endpoints.roles}`,
+    ];
     
-    const response = await fetch(url, {
-      method: 'GET',
-      credentials: 'include', // Use browser's session cookies
-      headers: {
-        'Content-Type': 'application/json',
-      },
-    });
+    for (const url of urls) {
+      try {
+        console.log(`[RolesService] 🎯 Trying: ${url}`);
+        const response = await fetch(url, {
+          method: 'GET',
+          credentials: 'include', // Use browser's session cookies
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+        });
 
-    if (!response.ok) {
-      console.error(`[RolesService] ❌ Failed to fetch roles: ${response.status} ${response.statusText}`);
-      return [];
+        if (response.ok) {
+          const contentType = response.headers.get('content-type');
+          if (!contentType || !contentType.includes('application/json')) {
+            console.warn('[RolesService] ⚠️ Response is not JSON (content-type:', contentType, ')');
+            continue; // Try next URL
+          }
+
+          const data = await response.json();
+          const roles: IvantiRole[] = data.value || data || [];
+          
+          console.log(`[RolesService] ✅ Loaded ${roles.length} roles`);
+          return roles;
+        } else {
+          const errorText = await response.text();
+          console.log(`[RolesService] ⚠️ Failed (${response.status}): ${errorText.substring(0, 200)}`);
+          // Try next URL
+        }
+      } catch (e: any) {
+        console.log(`[RolesService] ⚠️ Error with URL: ${e.message}`);
+        continue; // Try next URL
+      }
     }
-
-    const contentType = response.headers.get('content-type');
-    if (!contentType || !contentType.includes('application/json')) {
-      console.warn('[RolesService] ⚠️ Response is not JSON (content-type:', contentType, ')');
-      return [];
-    }
-
-    const data = await response.json();
-    const roles: IvantiRole[] = data.value || data || [];
     
-    console.log(`[RolesService] ✅ Loaded ${roles.length} roles`);
-    return roles;
+    // 401 errors are expected after logout/login - don't treat as critical error
+    console.warn(`[RolesService] ⚠️ All role fetch attempts failed (this is normal if session is not yet established)`);
+    return [];
   } catch (error) {
     console.error('[RolesService] ❌ Error fetching roles:', error);
     return [];

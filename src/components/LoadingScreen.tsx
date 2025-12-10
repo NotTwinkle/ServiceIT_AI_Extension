@@ -1,4 +1,5 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
+import { Theme, DEFAULT_THEME, THEME_STORAGE_KEY } from '../types/theme';
 
 interface LoadingScreenProps {
   message?: string;
@@ -10,8 +11,34 @@ interface LoadingScreenProps {
 }
 
 const LoadingScreen: React.FC<LoadingScreenProps> = ({ progress }) => {
-  // Normalize progress value to always be between 0 and 100
-  const safeProgress = Math.max(0, Math.min(100, progress?.progress ?? 0));
+  const [theme, setTheme] = useState<Theme>(DEFAULT_THEME);
+
+  // Load theme from storage
+  useEffect(() => {
+    chrome.storage.local.get([THEME_STORAGE_KEY], (result) => {
+      if (result[THEME_STORAGE_KEY]) {
+        try {
+          const storedTheme = result[THEME_STORAGE_KEY] as Theme;
+          if (storedTheme && storedTheme.colors && storedTheme.systemName && storedTheme.logo) {
+            setTheme(storedTheme);
+          }
+        } catch (error) {
+          console.error('Error loading theme:', error);
+        }
+      }
+    });
+  }, []);
+
+  // Get logo URL (handle base64, blob, or extension path)
+  const getLogoUrl = (): string => {
+    if (theme.logo.startsWith('data:image')) {
+      return theme.logo; // Base64 image
+    }
+    if (theme.logo.startsWith('blob:')) {
+      return theme.logo; // Object URL
+    }
+    return chrome.runtime.getURL(theme.logo); // Extension path
+  };
 
   return (
     <div 
@@ -47,17 +74,20 @@ const LoadingScreen: React.FC<LoadingScreenProps> = ({ progress }) => {
           <div 
             className="sit-relative sit-p-6 sit-rounded-2xl"
             style={{
-              background: 'linear-gradient(135deg, #002b5c 0%, #003d7a 100%)',
-              boxShadow: '0 10px 30px rgba(0, 43, 92, 0.3)',
+              background: `linear-gradient(135deg, ${theme.colors.primary} 0%, ${theme.colors.primary}CC 100%)`,
+              boxShadow: `0 10px 30px ${theme.colors.primary}4D`,
               animation: 'sit-breathe 2s ease-in-out infinite',
             }}
           >
             <img 
-              src={chrome.runtime.getURL("icons/SERVICEITLOGO.png")} 
-              alt="ServiceIT Logo" 
+              src={getLogoUrl()}
+              alt={`${theme.systemName} Logo`}
               className="sit-w-20 sit-h-20"
               style={{
                 filter: 'brightness(0) invert(1)',
+              }}
+              onError={(e) => {
+                e.currentTarget.src = chrome.runtime.getURL("icons/SERVICEITLOGO.png");
               }}
             />
           </div>
@@ -68,10 +98,10 @@ const LoadingScreen: React.FC<LoadingScreenProps> = ({ progress }) => {
           <h2 
             className="sit-text-3xl sit-font-bold sit-tracking-tight"
             style={{
-              color: '#002b5c',
+              color: theme.colors.primary,
             }}
           >
-            Service IT Plus
+            {theme.systemName}
           </h2>
           
           {/* AI Badge */}
@@ -79,9 +109,9 @@ const LoadingScreen: React.FC<LoadingScreenProps> = ({ progress }) => {
             <div 
               className="sit-px-4 sit-py-1.5 sit-rounded-full sit-text-sm sit-font-semibold"
               style={{
-                background: 'linear-gradient(135deg, #ff9900 0%, #ffb347 100%)',
+                background: `linear-gradient(135deg, ${theme.colors.secondary} 0%, ${theme.colors.secondary}CC 100%)`,
                 color: '#ffffff',
-                boxShadow: '0 4px 12px rgba(255, 153, 0, 0.3)',
+                boxShadow: `0 4px 12px ${theme.colors.secondary}4D`,
               }}
             >
               AI Assistant
@@ -93,7 +123,7 @@ const LoadingScreen: React.FC<LoadingScreenProps> = ({ progress }) => {
             <div 
               className="sit-w-2.5 sit-h-2.5 sit-rounded-full"
               style={{ 
-                background: 'linear-gradient(135deg, #002b5c 0%, #004d99 100%)',
+                background: `linear-gradient(135deg, ${theme.colors.primary} 0%, ${theme.colors.primary}CC 100%)`,
                 animation: 'sit-loading-bounce 0.6s ease-in-out infinite',
                 animationDelay: '0s',
               }}
@@ -101,7 +131,7 @@ const LoadingScreen: React.FC<LoadingScreenProps> = ({ progress }) => {
             <div 
               className="sit-w-2.5 sit-h-2.5 sit-rounded-full"
               style={{ 
-                background: 'linear-gradient(135deg, #002b5c 0%, #004d99 100%)',
+                background: `linear-gradient(135deg, ${theme.colors.primary} 0%, ${theme.colors.primary}CC 100%)`,
                 animation: 'sit-loading-bounce 0.6s ease-in-out infinite',
                 animationDelay: '0.2s',
               }}
@@ -109,7 +139,7 @@ const LoadingScreen: React.FC<LoadingScreenProps> = ({ progress }) => {
             <div 
               className="sit-w-2.5 sit-h-2.5 sit-rounded-full"
               style={{ 
-                background: 'linear-gradient(135deg, #002b5c 0%, #004d99 100%)',
+                background: `linear-gradient(135deg, ${theme.colors.primary} 0%, ${theme.colors.primary}CC 100%)`,
                 animation: 'sit-loading-bounce 0.6s ease-in-out infinite',
                 animationDelay: '0.4s',
               }}
@@ -120,35 +150,11 @@ const LoadingScreen: React.FC<LoadingScreenProps> = ({ progress }) => {
         {/* Status Message */}
         <p 
           className="sit-text-sm sit-font-medium sit-text-center sit-max-w-xs"
-          style={{ color: '#6b7280' }}
+          style={{ color: theme.colors.textMuted }}
         >
           {progress?.message || 'Identifying user and initializing assistant...'}
         </p>
 
-        {/* Progress Bar */}
-        <div className="sit-w-full sit-h-1.5 sit-bg-gray-200 sit-rounded-full sit-overflow-hidden">
-          <div 
-            className="sit-h-full sit-rounded-full sit-transition-all sit-duration-300"
-            style={{
-              background: safeProgress === 100 
-                ? 'linear-gradient(90deg, #10b981 0%, #059669 100%)'
-                : 'linear-gradient(90deg, #002b5c 0%, #ff9900 50%, #002b5c 100%)',
-              backgroundSize: safeProgress === 100 ? '100% 100%' : '200% 100%',
-              animation: safeProgress === 100 ? 'none' : 'sit-progress-slide 1.5s ease-in-out infinite',
-              width: `${safeProgress}%`,
-            }}
-          ></div>
-        </div>
-        
-        {/* Progress Percentage */}
-        {progress && (
-          <p 
-            className="sit-text-xs sit-font-medium sit-text-center"
-            style={{ color: '#9ca3af', marginTop: '8px' }}
-          >
-            {safeProgress}%
-          </p>
-        )}
       </div>
     </div>
   );

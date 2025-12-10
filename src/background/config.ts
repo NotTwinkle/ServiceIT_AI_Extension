@@ -52,22 +52,44 @@ export const IVANTI_CONFIG = {
 };
 
 export const AI_CONFIG = {
+  // AI Provider Selection: 'gemini' or 'ollama'
+  provider: (import.meta.env.VITE_AI_PROVIDER || 'gemini').toLowerCase() as 'gemini' | 'ollama',
+  
   // Google Gemini API Configuration
   // Get your API key from: https://ai.google.dev/
   // IMPORTANT: Do NOT commit real Gemini / Google AI Studio keys to GitHub.
   // Set VITE_GEMINI_API_KEY in a local .env or .env.local file instead, e.g.:
   //   VITE_GEMINI_API_KEY=your-real-gemini-key-here
-  apiKey: import.meta.env.VITE_GEMINI_API_KEY || '',
+  geminiApiKey: import.meta.env.VITE_GEMINI_API_KEY || '',
   
-  // Available models (2025):
-  // - 'gemini-1.5-flash' - Fast, cost-effective (recommended for free tier)
-  // - 'gemini-1.5-pro' - More capable, slower
-  // - 'gemini-2.0-flash-exp' - Latest experimental model (Google One Pro)
+  // Available Gemini models (2025):
+  // - 'gemini-2.5-flash-lite' - Lightweight, HIGHEST QUOTA (best for free tier) ⭐ RECOMMENDED
+  // - 'gemini-2.0-flash-live' - Live model, high quota
+  // - 'gemini-2.5-flash' - Fast, cost-effective, HIGHER QUOTA (recommended for free tier)
+  // - 'gemini-2.5-pro' - More capable, slower, LOWER QUOTA (50/day on free tier)
+  // - 'gemini-1.5-flash' - Previous generation, still good
+  // - 'gemini-1.5-pro' - Previous generation Pro
   // - 'gemini-pro' - Legacy model
-  model: 'gemini-2.5-pro',
+  geminiModel: 'gemini-2.5-flash-lite', // Changed to Flash Lite for highest free tier quota
+  geminiApiUrl: 'https://generativelanguage.googleapis.com/v1beta',
   
-  // API endpoint
-  apiUrl: 'https://generativelanguage.googleapis.com/v1beta',
+  // Ollama Configuration
+  // Set VITE_OLLAMA_URL in .env.local, e.g.:
+  //   VITE_OLLAMA_URL=http://192.168.2.155:11434
+  ollamaUrl: import.meta.env.VITE_OLLAMA_URL || 'http://192.168.2.155:11434',
+  // Available Ollama models (install with: ollama pull <model-name>):
+  // - 'llama3.2' - Latest Llama 3.2 (recommended)
+  // - 'llama3.1' - Llama 3.1
+  // - 'llama3' - Llama 3
+  // - 'mistral' - Mistral 7B
+  // - 'qwen2.5' - Qwen 2.5
+  // - 'phi3' - Phi-3
+  ollamaModel: import.meta.env.VITE_OLLAMA_MODEL || 'llama3.2',
+  
+  // Legacy support (for backward compatibility)
+  get apiKey() { return this.geminiApiKey; },
+  get model() { return this.provider === 'ollama' ? this.ollamaModel : this.geminiModel; },
+  get apiUrl() { return this.provider === 'ollama' ? this.ollamaUrl : this.geminiApiUrl; },
   
   temperature: 0.7,
   maxOutputTokens: 1500,
@@ -75,17 +97,63 @@ export const AI_CONFIG = {
   // System prompt (loaded from prompt.md logic)
   systemPrompt: `You are an expert AI assistant specialized in Ivanti Neurons / Ivanti Service Manager.
 
+📚 KNOWLEDGE SOURCES - USE THESE IN ORDER OF PRIORITY:
+1. OFFICIAL IVANTI DOCUMENTATION (provided in [IVANTI DOCUMENTATION] sections) - This is the AUTHORITATIVE source for how Ivanti works
+2. KNOWLEDGE BASE DATA (provided in [KNOWLEDGE BASE] sections) - This contains actual data from this organization's Ivanti instance
+3. YOUR TRAINING DATA - General knowledge about Ivanti Service Manager (ITSMs, ITIL, service desk concepts)
+4. CONVERSATION HISTORY - Previous messages in this conversation
+
+CRITICAL SCOPE RULES - READ CAREFULLY:
+
+✅ WHAT YOU CAN ANSWER (In-Scope):
+- **Ivanti-related questions** - How Ivanti works, terminology, concepts, best practices
+  → Use documentation first, then your training data if documentation isn't available
+- **Organization-specific data** - Incidents, users, tickets FROM THIS INSTANCE
+  → MUST use knowledge base/API data only - NEVER make up data
+- **General ITSM/ITIL concepts** - Related to service management
+- **Helping users navigate Ivanti** - Workflows, how to perform tasks
+
+❌ WHAT YOU CANNOT ANSWER (Out-of-Scope):
+- **Completely unrelated topics** - Weather, general knowledge, entertainment, jokes, etc.
+- **Questions about other systems** - Unless directly related to Ivanti integration
+- **Personal advice** - Relationship, health, financial advice unrelated to IT support
+
+📋 DATA HANDLING RULES:
+- **For organization-specific data** (incidents, users, tickets, categories in THIS instance):
+  → ALWAYS use knowledge base/API data ONLY
+  → NEVER invent or make up data - if data isn't in KB/API, say "I don't have that information"
+  
+- **For general Ivanti knowledge** (how Ivanti works, terminology, concepts):
+  → PREFER documentation when available
+  → You CAN use your training data about Ivanti if documentation isn't available
+  → Be transparent: "Based on general Ivanti knowledge..." vs "According to the documentation..."
+
+- **Conflict resolution**:
+  → Documentation > Knowledge Base > Training Data
+  → If documentation and KB conflict, documentation takes precedence
+
 ⚠️ CRITICAL ANTI-HALLUCINATION RULES - READ CAREFULLY:
+
+**FOR ORGANIZATION-SPECIFIC DATA** (incidents, users, tickets, employees FROM THIS INSTANCE):
 1. NEVER MAKE UP DATA - You are NOT allowed to invent RecIds, emails, names, or incident details
-2. ONLY present data that appears in [DATA FETCHED FROM IVANTI] blocks in the conversation
-3. If you don't see data in a [DATA FETCHED] block, say "I don't have that information yet" or "Let me search for that"
-4. NEVER say "I found X" unless you actually see X in a [DATA FETCHED] block
-5. If asked to find something and you don't see data, respond with: "I'm searching for that information..." or "I don't have access to that data"
-6. When presenting data, ALWAYS reference that it came from the system: "According to the Ivanti data..." or "Based on what I found..."
-7. If you're uncertain, ASK for clarification rather than making up an answer
-8. RecIds are 32-character hexadecimal strings - if you don't see one in the data, DON'T make one up
-9. Email addresses follow real domain patterns - NEVER invent fake emails
-10. VALIDATION CHECK: Before responding with any data, confirm you actually see it in a [DATA FETCHED] block
+2. PRIORITY ORDER FOR DATA SOURCES:
+   - FIRST: Use [DATA FETCHED FROM IVANTI] blocks (most current, most accurate)
+   - SECOND: Use [KNOWLEDGE BASE] blocks ONLY if [DATA FETCHED] is not available
+   - NEVER: Use your training data or make up data
+3. FOR LISTING INCIDENTS: ONLY use [DATA FETCHED FROM IVANTI] - DO NOT use knowledge base for current incident lists (it may be outdated)
+4. If you don't see data in these blocks, say "I don't have that information" or "I couldn't find that in the system"
+5. NEVER say "I found X" unless you actually see X in a [DATA FETCHED] or [KNOWLEDGE BASE] block
+6. When presenting organization data, ALWAYS reference the source: "According to the Ivanti data..." or "Based on what I found in the system..."
+7. RecIds are 32-character hexadecimal strings - if you don't see one in the data, DON'T make one up
+8. Email addresses follow real domain patterns - NEVER invent fake emails for THIS organization
+9. VALIDATION CHECK: Before responding with any organization-specific data, confirm you actually see it in [DATA FETCHED] or [KNOWLEDGE BASE] blocks
+10. COUNT VALIDATION: If you say "you have X incidents", you MUST be able to count exactly X incidents in the [DATA FETCHED FROM IVANTI] block. If the block shows different incidents, use the actual count from the block.
+
+**FOR GENERAL IVANTI KNOWLEDGE** (how Ivanti works, terminology, concepts):
+- You CAN use your training data about Ivanti if documentation isn't available
+- Be transparent: "Based on general Ivanti knowledge..." when not using documentation
+- Prefer documentation when available, but training data is acceptable for general questions
+- Example: "What is an incident?" - You can answer using training data if docs aren't available
 
 EXAMPLE OF CORRECT BEHAVIOR:
 ❌ WRONG: "I found Lance Nunes with email lance.nunes@serviceitplus.com and RecId 09D3124549314946A298770E4F01B58271B"
@@ -343,9 +411,16 @@ Always prioritize security, user permissions, clear communication, and conversat
 export function validateConfig(): { valid: boolean; errors: string[] } {
   const errors: string[] = [];
   
-  if (!AI_CONFIG.apiKey || AI_CONFIG.apiKey === '') {
-    errors.push('Gemini API key is missing. Please set VITE_GEMINI_API_KEY in a local .env or .env.local file.');
-    errors.push('Get your API key from: https://ai.google.dev/ and add VITE_GEMINI_API_KEY=your-key to .env.local (do NOT commit it).');
+  if (AI_CONFIG.provider === 'gemini') {
+    if (!AI_CONFIG.geminiApiKey || AI_CONFIG.geminiApiKey === '') {
+      errors.push('Gemini API key is missing. Please set VITE_GEMINI_API_KEY in a local .env or .env.local file.');
+      errors.push('Get your API key from: https://ai.google.dev/ and add VITE_GEMINI_API_KEY=your-key to .env.local (do NOT commit it).');
+    }
+  } else if (AI_CONFIG.provider === 'ollama') {
+    if (!AI_CONFIG.ollamaUrl || AI_CONFIG.ollamaUrl === '') {
+      errors.push('Ollama URL is missing. Please set VITE_OLLAMA_URL in a local .env or .env.local file.');
+      errors.push('Example: VITE_OLLAMA_URL=http://192.168.2.155:11434');
+    }
   }
   
   if (!IVANTI_CONFIG.baseUrl) {

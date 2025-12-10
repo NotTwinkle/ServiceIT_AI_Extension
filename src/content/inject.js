@@ -5,7 +5,7 @@
   let attempts = 0;
   const maxAttempts = 60; // 30 seconds (increased timeout for Neurons 2025.3)
 
-  function scanForUser() {
+  async function scanForUser() {
     try {
       // Log what's available in window object (comprehensive scan)
       if (attempts === 0) {
@@ -23,22 +23,126 @@
         console.log("🔍 ServiceIT: Ivanti-related keys:", ivantiKeys);
       }
 
+      // 0. FIRST: Try to scrape role from the UI (most reliable)
+      console.log("🔍 ServiceIT: Attempting to scrape role from UI...");
+      let roleFromUI = null;
+      
+      // Strategy A: Look for role in the user profile dropdown (top-right corner)
+      // In the screenshot, "Self Service" appears below "SITLance"
+      try {
+        // Wait a moment for UI to render
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
+        // Look for text in the top-right area that matches known roles
+        // Expanded list to match all possible role names
+        const knownRoles = [
+          'Admin', 'Administrator', 
+          'Self Service', 'Self Service User', 'SelfService', 'SelfServiceMobile',
+          'Service Desk Analyst', 'ServiceDeskAnalyst',
+          'Manager', 'Supervisor', 'Agent', 'Analyst',
+          'HR Manager', 'Finance Manager', 'Project Manager',
+          'Configuration Manager', 'Portfolio Manager'
+        ];
+        
+        // Scan all text elements in the page header
+        const allElements = document.querySelectorAll('*');
+        for (const el of allElements) {
+          // Check if element is in the top 150px of the page
+          const rect = el.getBoundingClientRect();
+          if (rect.top < 150 && rect.top >= 0) {
+            const text = el.textContent?.trim() || '';
+            // Check if text exactly matches a known role
+            if (knownRoles.includes(text)) {
+              roleFromUI = text;
+              console.log("✅ ServiceIT: Found role in UI:", roleFromUI);
+              break;
+            }
+            // Also check if text contains a known role (for cases like "Self Service User")
+            for (const role of knownRoles) {
+              if (text.includes(role) && text.length < 50) { // Avoid matching long text
+                roleFromUI = role;
+                console.log("✅ ServiceIT: Found role in UI (partial match):", roleFromUI);
+                break;
+              }
+            }
+            if (roleFromUI) break;
+          }
+        }
+        
+        // If not found in header, check for role info in any visible area
+        if (!roleFromUI) {
+          for (const el of allElements) {
+            const text = el.textContent?.trim() || '';
+            // Look for pattern like "Role: Self Service" or just "Self Service" near user name
+            if (text.includes('Role:') || text.includes('role:')) {
+              const roleMatch = text.match(/Role:\s*(.+)/i);
+              if (roleMatch && knownRoles.includes(roleMatch[1].trim())) {
+                roleFromUI = roleMatch[1].trim();
+                console.log("✅ ServiceIT: Found role label:", roleFromUI);
+                break;
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.log("ServiceIT: Could not scrape role from UI:", e);
+      }
+      
+      // Store UI role in sessionStorage if found
+      if (roleFromUI) {
+        try {
+          sessionStorage.setItem('currentActiveRoleFromUI', roleFromUI);
+          console.log("✅ ServiceIT: Stored UI role in sessionStorage:", roleFromUI);
+        } catch (e) {
+          console.error("ServiceIT: Could not store UI role");
+        }
+      }
+      
       // 1. Check window.Session (Found by brute-force scanner!)
       if (window.Session) {
         console.log("✅ ServiceIT: Found window.Session:", window.Session);
+        console.log("🔍 ServiceIT: Session keys:", Object.keys(window.Session));
         const s = window.Session;
         
+        // LOG ALL ROLE-RELATED FIELDS FOR DEBUGGING
+        console.log("🔍 ServiceIT: Debugging role fields:");
+        console.log("  - CurrentRole:", s.CurrentRole);
+        console.log("  - currentRole:", s.currentRole);
+        console.log("  - ActiveRole:", s.ActiveRole);
+        console.log("  - activeRole:", s.activeRole);
+        console.log("  - Role:", s.Role);
+        console.log("  - role:", s.role);
+        console.log("  - Roles:", s.Roles);
+        console.log("  - roles:", s.roles);
+        
         // Extract any available user data
+        // PRIORITY: Use UI-scraped role first, then session data
+        const sessionRole = s.CurrentRole || s.currentRole || s.ActiveRole || s.activeRole || s.Role || s.role;
         const userData = {
           recId: s.RecId || s.recId || s.UserId || s.userId || s.EmployeeRecId,
           loginId: s.LoginId || s.loginId || s.UserName || s.username || s.Email,
           email: s.Email || s.email,
           fullName: s.DisplayName || s.displayName || s.FullName || s.fullName || s.UserName,
-          role: s.Role || s.role || s.CurrentRole,
+          role: roleFromUI || sessionRole, // PREFER UI role over session
           isSuperAdmin: s.IsSuperAdmin,
           appName: s.AppName,
-          source: 'window.Session'
+          source: roleFromUI ? 'UI scrape + window.Session' : 'window.Session'
         };
+        
+        console.log("🔍 ServiceIT: Role decision:");
+        console.log("  - UI Role:", roleFromUI);
+        console.log("  - Session Role:", sessionRole);
+        console.log("  - Using:", userData.role);
+        
+        // Store the current active role in sessionStorage for later use
+        if (userData.role) {
+          try {
+            sessionStorage.setItem('currentActiveRole', userData.role);
+            console.log("✅ ServiceIT: Stored active role in sessionStorage:", userData.role);
+          } catch (e) {
+            console.error("ServiceIT: Could not store role in sessionStorage");
+          }
+        }
         
         // If we found any useful data, return it
         if (userData.loginId || userData.fullName || userData.recId) {
@@ -248,9 +352,9 @@
     return null;
   }
 
-  const poller = setInterval(() => {
+  const poller = setInterval(async () => {
     attempts++;
-    const user = scanForUser();
+    const user = await scanForUser();
     
     if (user) {
       clearInterval(poller);

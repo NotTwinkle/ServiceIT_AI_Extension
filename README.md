@@ -25,12 +25,37 @@ An AI-powered Chrome Extension for Ivanti Service Manager (success.serviceitplus
    npm install
    ```
 
-2. **Build the extension:**
+2. **Configure Gemini API Key (REQUIRED):**
+   
+   The AI Assistant requires a Google Gemini API key to function. Follow these steps:
+   
+   a. Get your API key:
+      - Visit https://ai.google.dev/
+      - Sign in with your Google account
+      - Click "Get API Key" and create a new key
+   
+   b. Create `.env.local` file in the project root:
+      ```bash
+      # Create the file
+      touch .env.local
+      ```
+   
+   c. Add your API key to `.env.local`:
+      ```
+      VITE_GEMINI_API_KEY=your-actual-api-key-here
+      ```
+   
+   **Important:** 
+   - The `.env.local` file is already in `.gitignore` (won't be committed)
+   - Never share your API key publicly
+   - The extension will NOT work without this key
+
+3. **Build the extension:**
    ```bash
    npm run build
    ```
 
-3. **Load in Chrome:**
+4. **Load in Chrome:**
    - Open Chrome and navigate to `chrome://extensions/`
    - Enable "Developer mode" (top right)
    - Click "Load unpacked"

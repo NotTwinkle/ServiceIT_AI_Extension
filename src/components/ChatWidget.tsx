@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { X, Send } from 'lucide-react';
+import { X, Send, ChevronDown, Settings, ChevronRight, Mail, Palette } from 'lucide-react';
+import { Theme, DEFAULT_THEME, THEME_STORAGE_KEY } from '../types/theme';
+import ThemeEditor from './ThemeEditor';
 
 interface UserInfo {
   recId?: string;
@@ -23,6 +25,14 @@ interface Message {
   timestamp: Date;
 }
 
+// Serializable version of Message for storage (Date becomes ISO string)
+interface StoredMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  timestamp: string; // ISO string format
+}
+
 interface ChatWidgetProps {
   currentUser?: UserInfo | null;
 }
@@ -35,45 +45,118 @@ const formatTitleCase = (value: string): string => {
     .join(' ');
 };
 
-const buildThinkingStatusSteps = (input: string, ticketId: string | null): string[] => {
-  const steps: string[] = ['🤔 Interpreting your request'];
+interface ThinkingStep {
+  text: string;
+  type: 'context' | 'action' | 'response';
+}
+
+const buildThinkingStatusSteps = (
+  input: string, 
+  ticketId: string | null,
+  conversationLength: number = 0
+): ThinkingStep[] => {
+  const steps: ThinkingStep[] = [];
   const trimmed = input.trim();
 
+  // Step 1: Always analyze conversation context first (like Cursor)
+  if (conversationLength > 10) {
+    steps.push({ 
+      text: 'Analyzing conversation context...', 
+      type: 'context' 
+    });
+  }
+
+  // Step 2: Check if summarization is needed
+  if (conversationLength > 30) {
+    steps.push({ 
+      text: 'Summarizing previous messages for better context...', 
+      type: 'context' 
+    });
+  } else if (conversationLength > 15) {
+    steps.push({ 
+      text: 'Reviewing conversation history...', 
+      type: 'context' 
+    });
+  }
+
+  // Step 3: Typo correction (always show)
+  steps.push({ 
+    text: 'Checking for typos and normalizing input...', 
+    type: 'context' 
+  });
+
+  // Step 4: Interpreting request
+  steps.push({ 
+    text: 'Interpreting your request...', 
+    type: 'action' 
+  });
+
   if (!trimmed) {
-    steps.push('🔍 Checking Ivanti for details');
-    steps.push('🧠 Formulating a helpful response');
+    steps.push({ 
+      text: 'Checking Ivanti for details...', 
+      type: 'action' 
+    });
+    steps.push({ 
+      text: 'Formulating a helpful response...', 
+      type: 'response' 
+    });
     return steps;
   }
 
   const lower = trimmed.toLowerCase();
 
+  // Context-specific actions
   if (ticketId && (lower.includes('this ticket') || lower.includes('incident') || lower.includes('update') || lower.includes('status'))) {
-    steps.push(`🛠️ Reviewing ticket #${ticketId} in Ivanti`);
+    steps.push({ 
+      text: `Reviewing ticket #${ticketId} in Ivanti...`, 
+      type: 'action' 
+    });
   } else if (lower.includes('create') && lower.includes('incident')) {
-    steps.push('🛠️ Drafting the new incident details');
+    steps.push({ 
+      text: 'Drafting the new incident details...', 
+      type: 'action' 
+    });
   } else if ((lower.includes('find') && lower.includes('user')) || lower.includes('employee')) {
     const match = trimmed.match(/["']([^"']+)["']/);
     if (match && match[1]) {
-      steps.push(`🔎 Searching Ivanti for ${formatTitleCase(match[1])}`);
+      steps.push({ 
+        text: `Searching Ivanti for ${formatTitleCase(match[1])}...`, 
+        type: 'action' 
+      });
     } else {
       const words = trimmed.split(/\s+/);
       const possibleName = words.slice(-3).join(' ');
       const looksLikeName = possibleName.split(' ').filter(Boolean).every(word => /^[a-zA-Z][a-zA-Z'.-]*$/.test(word));
-      steps.push(
-        looksLikeName
-          ? `🔎 Searching Ivanti for ${formatTitleCase(possibleName)}`
-          : '🔎 Searching Ivanti for that user'
-      );
+      steps.push({
+        text: looksLikeName
+          ? `Searching Ivanti for ${formatTitleCase(possibleName)}...`
+          : 'Searching Ivanti for that user...',
+        type: 'action'
+      });
     }
   } else if (lower.includes('find') && (lower.includes('ticket') || lower.includes('incident'))) {
-    steps.push('📂 Looking up matching incidents in Ivanti');
+    steps.push({ 
+      text: 'Looking up matching incidents in Ivanti...', 
+      type: 'action' 
+    });
   } else if (lower.includes('summary') || lower.includes('explain')) {
-    steps.push('🧠 Summarizing what I know');
+    steps.push({ 
+      text: 'Summarizing information from Ivanti...', 
+      type: 'action' 
+    });
   } else {
-    steps.push('🔍 Checking Ivanti for relevant data');
+    steps.push({ 
+      text: 'Checking Ivanti for relevant data...', 
+      type: 'action' 
+    });
   }
 
-  steps.push('✨ Formulating a helpful response');
+  // Final step: Generating response
+  steps.push({ 
+    text: 'Formulating a helpful response...', 
+    type: 'response' 
+  });
+  
   return steps;
 };
 
@@ -84,24 +167,180 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
   const [isLoading, setIsLoading] = useState(false);
   const [ticketId, setTicketId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
   const [thinkingSteps, setThinkingSteps] = useState<string[]>([]);
   const [thinkingStepIndex, setThinkingStepIndex] = useState(0);
+  const [thinkingStepObjects, setThinkingStepObjects] = useState<ThinkingStep[]>([]);
   const thinkingIntervalRef = useRef<number | null>(null);
   const [isHidden, setIsHidden] = useState(false);
   const [isHovering, setIsHovering] = useState(false);
   const [widgetWidth, setWidgetWidth] = useState(384); // Default: 384px (w-96)
+  // Default to Flash Lite for highest quota (best for free tier)
+  const [selectedModel, setSelectedModel] = useState('gemini-2.5-flash-lite');
+  const [aiProvider, setAiProvider] = useState<'gemini' | 'ollama'>('gemini');
+  const [isModelDropdownOpen, setIsModelDropdownOpen] = useState(false);
+  const modelDropdownRef = useRef<HTMLDivElement>(null);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isWidgetWidthExpanded, setIsWidgetWidthExpanded] = useState(false);
+  const [isExportChatExpanded, setIsExportChatExpanded] = useState(false);
+  const [theme, setTheme] = useState<Theme>(DEFAULT_THEME);
+  const [isThemeEditorOpen, setIsThemeEditorOpen] = useState(false);
+  const [tempTheme, setTempTheme] = useState<Theme>(DEFAULT_THEME); // Temporary theme for editing
+
+  // Available Gemini models
+  const geminiModels = [
+    { value: 'gemini-2.5-flash-lite', label: 'Gemini 2.5 Flash Lite', description: 'Lightweight, highest quota (best for free tier)' },
+    { value: 'gemini-2.0-flash-live', label: 'Gemini 2.0 Flash Live', description: 'Live model, high quota' },
+    { value: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash', description: 'Fast, higher quota (recommended)' },
+    { value: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro', description: 'Most capable, 50/day limit (free tier)' },
+    { value: 'gemini-1.5-flash', label: 'Gemini 1.5 Flash', description: 'Previous generation Flash' },
+    { value: 'gemini-1.5-pro', label: 'Gemini 1.5 Pro', description: 'Previous generation Pro' },
+  ];
+
+  // Available Ollama models
+  const ollamaModels = [
+    { value: 'llama3.2', label: 'Llama 3.2', description: 'Latest Llama 3.2 (recommended)' },
+    { value: 'llama3.1', label: 'Llama 3.1', description: 'Llama 3.1' },
+    { value: 'llama3', label: 'Llama 3', description: 'Llama 3' },
+    { value: 'mistral', label: 'Mistral', description: 'Mistral 7B' },
+    { value: 'qwen2.5', label: 'Qwen 2.5', description: 'Qwen 2.5' },
+    { value: 'phi3', label: 'Phi-3', description: 'Phi-3' },
+  ];
+
+  // Get available models based on provider
+  const availableModels = aiProvider === 'ollama' ? ollamaModels : geminiModels;
  
-  // Load hidden state and widget width from storage on mount
+  // Load theme from storage on mount
   useEffect(() => {
-    chrome.storage.local.get(['aiAssistantHidden', 'chatWidgetWidth'], (result) => {
+    chrome.storage.local.get([THEME_STORAGE_KEY], (result) => {
+      if (result[THEME_STORAGE_KEY]) {
+        try {
+          const storedTheme = result[THEME_STORAGE_KEY] as Theme;
+          // Validate theme structure
+          if (storedTheme && storedTheme.colors && storedTheme.systemName && storedTheme.logo) {
+            setTheme(storedTheme);
+          } else {
+            console.warn('Invalid theme in storage, using default');
+            setTheme(DEFAULT_THEME);
+          }
+        } catch (error) {
+          console.error('Error loading theme:', error);
+          setTheme(DEFAULT_THEME);
+        }
+      }
+    });
+  }, []);
+
+  // Save theme to storage when it changes
+  useEffect(() => {
+    chrome.storage.local.set({ [THEME_STORAGE_KEY]: theme });
+  }, [theme]);
+
+  // Load AI provider from config and storage
+  useEffect(() => {
+    // Get provider from storage or default to gemini
+    chrome.storage.local.get(['aiProvider', 'aiAssistantHidden', 'chatWidgetWidth', 'selectedAIModel'], (result) => {
+      // Determine provider: check storage first, then infer from model, then default to gemini
+      let provider: 'gemini' | 'ollama' = 'gemini';
+      
+      if (result.aiProvider) {
+        provider = (result.aiProvider.toLowerCase() as 'gemini' | 'ollama') || 'gemini';
+      } else if (result.selectedAIModel) {
+        // Infer provider from model name if provider not set
+        const ollamaModels = ['llama3.2', 'llama3.1', 'llama3', 'mistral', 'qwen2.5', 'phi3'];
+        if (ollamaModels.includes(result.selectedAIModel)) {
+          provider = 'ollama';
+        }
+      }
+      
+      setAiProvider(provider);
+
       if (result.aiAssistantHidden === true) {
         setIsHidden(true);
       }
       if (result.chatWidgetWidth) {
         setWidgetWidth(result.chatWidgetWidth);
       }
+      
+      // Model selection based on provider
+      const validGeminiModels = [
+        'gemini-2.5-flash-lite', 'gemini-2.0-flash-live', 'gemini-2.5-flash', 
+        'gemini-2.5-pro', 'gemini-1.5-flash', 'gemini-1.5-pro'
+      ];
+      const validOllamaModels = [
+        'llama3.2', 'llama3.1', 'llama3', 'mistral', 'qwen2.5', 'phi3'
+      ];
+      
+      if (result.selectedAIModel) {
+        if (provider === 'ollama') {
+          // Ollama models
+          if (validOllamaModels.includes(result.selectedAIModel)) {
+            setSelectedModel(result.selectedAIModel);
+          } else {
+            // Invalid or Gemini model - default to llama3.2
+            setSelectedModel('llama3.2');
+            chrome.storage.local.set({ selectedAIModel: 'llama3.2' });
+          }
+        } else {
+          // Gemini models
+          if (validGeminiModels.includes(result.selectedAIModel)) {
+            // MIGRATION: Migrate Pro models to Flash Lite for best quota
+            if (result.selectedAIModel === 'gemini-2.5-pro' || result.selectedAIModel === 'gemini-1.5-pro') {
+              console.log('🔄 Migrating from Pro to Flash Lite model for best quota');
+              setSelectedModel('gemini-2.5-flash-lite');
+              chrome.storage.local.set({ selectedAIModel: 'gemini-2.5-flash-lite' });
+            } 
+            // MIGRATION: Migrate regular Flash to Flash Lite for even better quota
+            else if (result.selectedAIModel === 'gemini-2.5-flash' || result.selectedAIModel === 'gemini-1.5-flash') {
+              console.log('🔄 Migrating from Flash to Flash Lite model for best quota');
+              setSelectedModel('gemini-2.5-flash-lite');
+              chrome.storage.local.set({ selectedAIModel: 'gemini-2.5-flash-lite' });
+            } else {
+              // Keep Flash Lite or Flash Live if already selected
+              setSelectedModel(result.selectedAIModel);
+            }
+          } else {
+            // Invalid model stored, reset to Flash Lite
+            setSelectedModel('gemini-2.5-flash-lite');
+            chrome.storage.local.set({ selectedAIModel: 'gemini-2.5-flash-lite' });
+          }
+        }
+      } else {
+        // No stored preference - set default based on provider
+        const defaultModel = provider === 'ollama' ? 'llama3.2' : 'gemini-2.5-flash-lite';
+        setSelectedModel(defaultModel);
+        chrome.storage.local.set({ selectedAIModel: defaultModel });
+      }
     });
   }, []);
+
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (modelDropdownRef.current && !modelDropdownRef.current.contains(event.target as Node)) {
+        setIsModelDropdownOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  // Auto-focus input and scroll to bottom when chat opens
+  useEffect(() => {
+    if (isOpen && !isLoading) {
+      // Small delay to ensure input is rendered
+      setTimeout(() => {
+        inputRef.current?.focus();
+      }, 100);
+      
+      // Scroll to bottom if there are messages
+      if (messages.length > 0) {
+        setTimeout(() => {
+          messagesEndRef.current?.scrollIntoView({ behavior: 'auto' }); // Instant scroll when opening
+        }, 150);
+      }
+    }
+  }, [isOpen, isLoading]);
 
   // Save widget width to storage when it changes
   useEffect(() => {
@@ -109,6 +348,198 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
       chrome.storage.local.set({ chatWidgetWidth: widgetWidth });
     }
   }, [widgetWidth]);
+
+  // Save selected model to storage when it changes
+  useEffect(() => {
+    chrome.storage.local.set({ selectedAIModel: selectedModel });
+  }, [selectedModel]);
+
+  // Get storage key for current user's conversation history
+  const getConversationStorageKey = (): string | null => {
+    if (!currentUser) return null;
+    const userId = currentUser.loginId || currentUser.recId;
+    return userId ? `conversationHistory_${userId}` : null;
+  };
+
+  // Helper function to get logo URL (handle base64, blob, or extension path)
+  const getLogoUrl = (): string => {
+    if (theme.logo.startsWith('data:image')) {
+      return theme.logo; // Base64 image
+    }
+    if (theme.logo.startsWith('blob:')) {
+      return theme.logo; // Object URL
+    }
+    return chrome.runtime.getURL(theme.logo); // Extension path
+  };
+
+  // Helper function to create welcome message
+  const createWelcomeMessage = () => {
+    if (!currentUser) return;
+    
+    const userName = currentUser?.fullName || currentUser?.loginId || 'there';
+    const userContext = currentUser?.team ? ` from ${currentUser.team}` : '';
+    const params = new URLSearchParams(window.location.search);
+    const recId = params.get('RecId');
+    
+    const welcomeMessage: Message = {
+      id: '1',
+      role: 'assistant',
+      content: recId
+        ? `Hello ${userName}${userContext}! 👋 I'm here to assist you with Ticket #${recId}. How can I help you today?`
+        : `Hello ${userName}${userContext}! 👋 I'm here to help you with Ivanti. What would you like to do today?`,
+      timestamp: new Date(),
+    };
+    
+    setMessages([welcomeMessage]);
+    
+    // Scroll to bottom after welcome message is created
+    setTimeout(() => {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'auto' });
+    }, 100);
+  };
+
+  // Convert Message to StoredMessage (for storage)
+  const messageToStored = (msg: Message): StoredMessage => ({
+    ...msg,
+    timestamp: msg.timestamp.toISOString(),
+  });
+
+  // Convert StoredMessage to Message (from storage)
+  const storedToMessage = (stored: StoredMessage): Message => ({
+    ...stored,
+    timestamp: new Date(stored.timestamp),
+  });
+
+  // Listen for logout events and clear messages
+  useEffect(() => {
+    const handleLogout = (message: any, _sender: any, sendResponse: Function) => {
+      if (message.type === 'USER_LOGGED_OUT') {
+        console.log('🚪 ========================================');
+        console.log('🚪 ChatWidget: USER_LOGGED_OUT received!');
+        console.log('🚪 ========================================');
+        
+        // Clear messages from memory immediately
+        setMessages([]);
+        
+        // Close the widget
+        setIsOpen(false);
+        
+        console.log('✅ ChatWidget: Cleared messages and closed widget');
+        
+        // Clear stored conversation history for current user
+        const storageKey = getConversationStorageKey();
+        if (storageKey) {
+          console.log(`🧹 ChatWidget: Clearing conversation history: ${storageKey}`);
+          chrome.storage.local.remove([storageKey], () => {
+            console.log('✅ ChatWidget: Cleared conversation history from storage');
+          });
+        }
+        
+        sendResponse({ success: true });
+      }
+      return true; // Keep channel open for async response
+    };
+
+    chrome.runtime.onMessage.addListener(handleLogout);
+    return () => {
+      chrome.runtime.onMessage.removeListener(handleLogout);
+    };
+  }, [currentUser]);
+
+  // Load conversation history from storage on mount
+  // 2025 ENTERPRISE BEST PRACTICE: Session isolation with timestamp verification
+  useEffect(() => {
+    const storageKey = getConversationStorageKey();
+    if (!storageKey || !currentUser) return;
+
+    console.log('🔍 ChatWidget: Checking for conversation history...');
+
+    // Verify stored user before loading history
+    chrome.storage.local.get(['currentUser', storageKey], (result) => {
+      // If currentUser doesn't exist in storage, user was logged out - don't load history
+      if (!result.currentUser) {
+        console.log('🚪 ChatWidget: No user session found, starting fresh conversation');
+        createWelcomeMessage();
+        return;
+      }
+
+      // Verify the stored user matches current user (prevent loading wrong user's history)
+      const storedUser = result.currentUser;
+      const currentUserId = currentUser.loginId || currentUser.recId;
+      const storedUserId = storedUser.loginId || storedUser.recId;
+      
+      if (currentUserId !== storedUserId) {
+        console.log('🔄 ChatWidget: User mismatch, starting fresh conversation');
+        createWelcomeMessage();
+        // Clear old user's history
+        chrome.storage.local.remove([storageKey], () => {
+          console.log('✅ ChatWidget: Cleared mismatched user history');
+        });
+        return;
+      }
+
+      const storedMessages = result[storageKey] as StoredMessage[] | undefined;
+      
+      if (storedMessages && Array.isArray(storedMessages) && storedMessages.length > 0) {
+        // Restore messages from storage (only if NOT a fresh session)
+        const restoredMessages = storedMessages.map(storedToMessage);
+        console.log(`✅ ServiceIT: Restored ${restoredMessages.length} messages from conversation history`);
+        setMessages(restoredMessages);
+        
+        // Auto-scroll to bottom after restoring messages (with delay to ensure DOM is rendered)
+        setTimeout(() => {
+          messagesEndRef.current?.scrollIntoView({ behavior: 'auto' }); // Use 'auto' for instant scroll on load
+        }, 200);
+      } else {
+        // No stored history - create welcome message
+        console.log('🆕 ChatWidget: No history found, creating welcome message');
+        createWelcomeMessage();
+      }
+    });
+  }, [currentUser?.loginId, currentUser?.recId]); // Only reload if user changes
+
+  // Save conversation history to storage whenever messages change
+  // 2025 BEST PRACTICE: Persist history during session, clear on logout
+  useEffect(() => {
+    const storageKey = getConversationStorageKey();
+    if (!storageKey || !currentUser || messages.length === 0) return;
+
+    // Don't save if only welcome message exists (avoid overwriting with just welcome)
+    const hasRealConversation = messages.some(
+      (msg) => msg.id !== '1' || msg.role === 'user'
+    );
+
+    if (hasRealConversation) {
+      const storedMessages = messages.map(messageToStored);
+      chrome.storage.local.set({ [storageKey]: storedMessages }, () => {
+        console.log(`💾 ServiceIT: Saved ${storedMessages.length} messages to conversation history`);
+      });
+    }
+  }, [messages, currentUser?.loginId, currentUser?.recId]);
+
+  // Detect user change (logout) and clear conversation history
+  // 2025 BEST PRACTICE: Clear stored conversation when user logs out
+  const prevUserRef = useRef<string | null>(null);
+  useEffect(() => {
+    const currentUserId = currentUser?.loginId || currentUser?.recId || null;
+    const prevUserId = prevUserRef.current;
+
+    // If user changed (logout detected), clear previous user's conversation from storage
+    if (prevUserId && prevUserId !== currentUserId && prevUserId) {
+      const previousStorageKey = `conversationHistory_${prevUserId}`;
+      console.log('🔄 ServiceIT: User changed (logout detected), clearing previous user\'s conversation from storage');
+      
+      // Clear previous user's conversation from chrome.storage.local
+      chrome.storage.local.remove([previousStorageKey], () => {
+        console.log(`✅ ServiceIT: Cleared conversation history for user: ${prevUserId}`);
+      });
+      
+      // Clear from memory
+      setMessages([]);
+    }
+
+    prevUserRef.current = currentUserId;
+  }, [currentUser?.loginId, currentUser?.recId]);
 
   // Extract RecId from URL on mount
   useEffect(() => {
@@ -128,33 +559,17 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
         role: currentUser.role
       });
     }
-    
-    // Create personalized greeting
-    const userName = currentUser?.fullName || currentUser?.loginId || 'there';
-    const userContext = currentUser?.team ? ` from ${currentUser.team}` : '';
-    
-    // Add welcome message with user's name
-    if (recId) {
-      setMessages([{
-        id: '1',
-        role: 'assistant',
-        content: `Hello ${userName}${userContext}! 👋 I'm here to assist you with Ticket #${recId}. How can I help you today?`,
-        timestamp: new Date(),
-      }]);
-    } else {
-      setMessages([{
-        id: '1',
-        role: 'assistant',
-        content: `Hello ${userName}${userContext}! 👋 I'm here to assist you. Please open a ticket to get started.`,
-        timestamp: new Date(),
-      }]);
-    }
   }, [currentUser]);
 
-  // Auto-scroll to bottom when new messages arrive
+  // Auto-scroll to bottom when new messages arrive or chat opens
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+    if (isOpen && messages.length > 0) {
+      // Use setTimeout to ensure DOM is fully rendered before scrolling
+      setTimeout(() => {
+        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      }, 100);
+    }
+  }, [messages, isOpen]);
 
   useEffect(() => {
     if (!isLoading || thinkingSteps.length <= 1) {
@@ -181,7 +596,7 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
         }
         return prev + 1;
       });
-    }, 1400);
+    }, 1200); // Slightly faster progression for better UX (like Cursor)
 
     return () => {
       if (thinkingIntervalRef.current) {
@@ -201,8 +616,8 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
       timestamp: new Date(),
     };
 
-    // Build thinking steps BEFORE setting loading state
-    const steps = buildThinkingStatusSteps(userMessage.content, ticketId);
+    // Build thinking steps BEFORE setting loading state (include conversation length for context management)
+    const steps = buildThinkingStatusSteps(userMessage.content, ticketId, messages.length);
     
     // Add user message first
     setMessages(prev => [...prev, userMessage]);
@@ -210,7 +625,8 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
     
     // Set loading state and thinking steps together
     setIsLoading(true);
-    setThinkingSteps(steps);
+    setThinkingStepObjects(steps); // Store full step objects
+    setThinkingSteps(steps.map(s => s.text)); // Also keep string array for backward compatibility
     setThinkingStepIndex(0);
     
     // Scroll to bottom to show thinking indicator
@@ -220,13 +636,20 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
 
     try {
       // Send message to background script (which handles AI processing)
-      const response = await chrome.runtime.sendMessage({
-        type: 'SEND_MESSAGE',
-        message: userMessage.content,
-        ticketId: ticketId,
-        currentUser: currentUser, // Pass current user context
-        timestamp: userMessage.timestamp.toISOString(),
-      });
+      // Add timeout to prevent getting stuck (90 seconds max - accounts for retries)
+      const response = await Promise.race([
+        chrome.runtime.sendMessage({
+          type: 'SEND_MESSAGE',
+          message: userMessage.content,
+          ticketId: ticketId,
+          currentUser: currentUser, // Pass current user context
+          timestamp: userMessage.timestamp.toISOString(),
+          model: selectedModel, // Pass selected AI model
+        }),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Request timeout: AI response took too long. This might be due to rate limiting or network issues. Please try again.')), 90000)
+        )
+      ]) as any;
 
       if (!response || !response.success) {
         throw new Error(response?.error || 'Failed to send message');
@@ -271,7 +694,13 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
         thinkingIntervalRef.current = null;
       }
       setThinkingSteps([]);
+      setThinkingStepObjects([]);
       setThinkingStepIndex(0);
+      
+      // Auto-focus input after message is sent
+      setTimeout(() => {
+        inputRef.current?.focus();
+      }, 100);
     }
   };
 
@@ -284,6 +713,34 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
 
   const toggleChat = () => {
     setIsOpen(!isOpen);
+  };
+
+  // Clear conversation (2025 BEST PRACTICE: User-controlled data deletion)
+  const clearConversation = () => {
+    if (!confirm('Are you sure you want to clear this conversation? This action cannot be undone.')) {
+      return;
+    }
+
+    // Clear from memory
+    setMessages([]);
+    
+    // Clear from storage
+    const storageKey = getConversationStorageKey();
+    if (storageKey) {
+      chrome.storage.local.remove([storageKey], () => {
+        console.log('✅ ChatWidget: User cleared conversation history');
+      });
+    }
+
+    // Clear from background script (in-memory conversation)
+    chrome.runtime.sendMessage({
+      type: 'CLEAR_CONVERSATION'
+    }).catch(() => {
+      // Ignore errors
+    });
+
+    // Create new welcome message
+    createWelcomeMessage();
   };
 
   const handleHide = () => {
@@ -392,7 +849,7 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
               >
                 <span 
                   style={{ 
-                    color: '#002b5c',
+                    color: theme.colors.primary,
                     fontSize: '18px',
                     fontWeight: '900',
                     letterSpacing: '0.3px',
@@ -404,7 +861,7 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
                 </span>
                 <span 
             style={{
-                    color: '#ff9900',
+                    color: theme.colors.secondary,
                     fontSize: '18px',
                     fontWeight: '900',
                     letterSpacing: '0.3px',
@@ -427,7 +884,7 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
                   width: '32px',
                   height: '32px',
                   color: 'white',
-                  backgroundColor: '#002b5c',
+                  backgroundColor: theme.colors.primary,
                   opacity: isHovering ? 1 : 0,
                   transform: isHovering ? 'scale(1)' : 'scale(0.8)',
                   visibility: isHovering ? 'visible' : 'hidden',
@@ -466,17 +923,17 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
             onClick={toggleChat}
             className="sit-group sit-w-20 sit-h-20 sit-rounded-full sit-cursor-pointer sit-transition-all sit-duration-300 sit-flex sit-items-center sit-justify-center sit-pointer-events-auto sit-border-0 sit-overflow-hidden sit-relative"
             style={{
-              backgroundColor: '#002b5c',
-              boxShadow: '0 6px 24px rgba(0, 43, 92, 0.5)',
+              backgroundColor: theme.colors.primary,
+              boxShadow: `0 6px 24px ${theme.colors.primary}80`,
               padding: '12px',
             }}
             onMouseEnter={(e) => {
               e.currentTarget.style.transform = 'scale(1.1)';
-              e.currentTarget.style.boxShadow = '0 8px 32px rgba(0, 43, 92, 0.7)';
+              e.currentTarget.style.boxShadow = `0 8px 32px ${theme.colors.primary}B3`;
             }}
             onMouseLeave={(e) => {
               e.currentTarget.style.transform = 'scale(1)';
-              e.currentTarget.style.boxShadow = '0 6px 24px rgba(0, 43, 92, 0.5)';
+              e.currentTarget.style.boxShadow = `0 6px 24px ${theme.colors.primary}80`;
             }}
                 aria-label="Open AI Assistant"
           >
@@ -490,7 +947,7 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
             />
             
             <img 
-              src={chrome.runtime.getURL('icons/SERVICEITLOGO.png')}
+              src={getLogoUrl()}
               alt="Chat"
               style={{
                 width: '100%',
@@ -498,6 +955,9 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
                 objectFit: 'contain',
                 display: 'block',
                 filter: 'brightness(0) invert(1)'
+              }}
+              onError={(e) => {
+                e.currentTarget.src = chrome.runtime.getURL('icons/SERVICEITLOGO.png');
               }}
             />
           </button>
@@ -571,7 +1031,7 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
           <div
             className="sit-px-5 sit-py-4 sit-flex sit-items-center sit-justify-between sit-border-0"
             style={{ 
-              backgroundColor: '#002b5c',
+              backgroundColor: theme.colors.primary,
               borderBottom: '1px solid rgba(255, 255, 255, 0.1)',
             }}
           >
@@ -585,13 +1045,16 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
                 }}
               >
                 <img 
-                  src={chrome.runtime.getURL('icons/SERVICEITLOGO.png')}
-                  alt="Service IT Plus"
+                  src={getLogoUrl()}
+                  alt={theme.systemName}
                   style={{
                     width: '100%',
                     height: '100%',
                     objectFit: 'contain',
                     display: 'block',
+                  }}
+                  onError={(e) => {
+                    e.currentTarget.src = chrome.runtime.getURL('icons/SERVICEITLOGO.png');
                   }}
                 />
               </div>
@@ -603,11 +1066,11 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
                   lineHeight: '1.3',
                   margin: '0',
                 }}>
-                  Service IT Plus
+                  {theme.systemName}
                 </span>
                 {ticketId ? (
                   <span style={{ 
-                    color: '#ff9900',
+                    color: theme.colors.secondary,
                     fontSize: '12px',
                     fontWeight: '500',
                     lineHeight: '1.3',
@@ -628,76 +1091,36 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
               </div>
             </div>
             <div className="sit-flex sit-items-center sit-gap-2">
-              {/* Width Control Buttons */}
-              <div className="sit-flex sit-items-center sit-gap-1" style={{ marginRight: '4px' }}>
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setWidgetWidth(prev => Math.max(300, prev - 50));
-                  }}
-                  className="sit-cursor-pointer sit-border-0 sit-rounded-lg sit-flex sit-items-center sit-justify-center"
-                  style={{
-                    width: '24px',
-                    height: '24px',
-                    backgroundColor: 'rgba(255, 255, 255, 0.12)',
-                    color: '#ffffff',
-                    fontSize: '16px',
-                    fontWeight: '600',
-                    transition: 'all 0.2s',
-                  }}
-                  onMouseEnter={(e) => {
-                    e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.2)';
-                  }}
-                  onMouseLeave={(e) => {
-                    e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.12)';
-                  }}
-                  title="Decrease width"
-                  aria-label="Decrease width"
-                >
-                  −
-                </button>
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setWidgetWidth(prev => Math.min(window.innerWidth - 40, 800, prev + 50));
-                  }}
-                  className="sit-cursor-pointer sit-border-0 sit-rounded-lg sit-flex sit-items-center sit-justify-center"
-                  style={{
-                    width: '24px',
-                    height: '24px',
-                    backgroundColor: 'rgba(255, 255, 255, 0.12)',
-                    color: '#ffffff',
-                    fontSize: '16px',
-                    fontWeight: '600',
-                    transition: 'all 0.2s',
-                  }}
-                  onMouseEnter={(e) => {
-                    e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.2)';
-                  }}
-                  onMouseLeave={(e) => {
-                    e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.12)';
-                  }}
-                  title="Increase width"
-                  aria-label="Increase width"
-                >
-                  +
-                </button>
-              </div>
+              {/* Settings Button */}
               <button
-                onClick={exportChat}
-                className="sit-h-8 sit-px-2 sit-rounded-lg sit-text-xs sit-font-medium sit-cursor-pointer sit-transition-all sit-duration-200 sit-border-0"
-                style={{
-                  backgroundColor: 'rgba(255, 255, 255, 0.12)',
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setIsSettingsOpen(!isSettingsOpen);
+                }}
+                className="sit-w-8 sit-h-8 sit-rounded-lg sit-flex sit-items-center sit-justify-center sit-cursor-pointer sit-transition-all sit-duration-200 sit-border-0"
+                style={{ 
+                  backgroundColor: isSettingsOpen ? 'rgba(255, 255, 255, 0.2)' : 'transparent',
                   color: '#ffffff',
                 }}
                 onMouseEnter={(e) => {
-                  e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.2)';
+                  if (!isSettingsOpen) {
+                    e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.15)';
+                  }
                 }}
                 onMouseLeave={(e) => {
-                  e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.12)';
+                  if (!isSettingsOpen) {
+                    e.currentTarget.style.backgroundColor = 'transparent';
+                  }
                 }}
+                title="Settings"
+                aria-label="Settings"
               >
-                Export
+                <div style={{ color: '#ffffff' }}>
+                  <Settings 
+                    size={18} 
+                    strokeWidth={2}
+                  />
+                </div>
               </button>
               <button
                 onClick={toggleChat}
@@ -722,7 +1145,7 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
           <div 
             className="sit-flex-1 sit-overflow-y-auto sit-px-4 sit-py-6"
             style={{ 
-              backgroundColor: '#f7f8fa',
+              backgroundColor: theme.colors.surface,
               position: 'relative', // For absolute positioning of background
             }}
           >
@@ -738,7 +1161,7 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
                 opacity: '0.05', // Very subtle watermark
                 pointerEvents: 'none', // Allow clicking through
                 zIndex: 0,
-                backgroundImage: `url(${chrome.runtime.getURL('icons/SERVICEITLOGO.png')})`,
+                backgroundImage: `url(${getLogoUrl()})`,
                 backgroundSize: 'contain',
                 backgroundRepeat: 'no-repeat',
                 backgroundPosition: 'center',
@@ -746,45 +1169,76 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
               }}
             />
 
-            <div className="sit-flex sit-flex-col sit-gap-4" style={{ position: 'relative', zIndex: 1 }}>
+            <div className="sit-flex sit-flex-col sit-gap-5" style={{ position: 'relative', zIndex: 1 }}>
               {messages.map((message) => (
                 <div
                   key={message.id}
-                  className="sit-flex sit-flex-col sit-gap-1 sit-fade-in-up"
+                  className="sit-flex sit-flex-col sit-gap-2 sit-fade-in-up"
                   style={{
                     alignItems: message.role === 'user' ? 'flex-end' : 'flex-start',
                   }}
                 >
                   <div
-                    className="sit-px-4 sit-py-3 sit-rounded-2xl sit-max-w-xs sit-border-0"
+                    className="sit-rounded-2xl sit-border-0"
                     style={message.role === 'user' ? { 
-                      backgroundColor: '#002b5c',
+                      backgroundColor: theme.colors.primary,
                       color: '#ffffff !important',
                       borderBottomRightRadius: '4px',
                       boxShadow: '0 4px 12px rgba(0, 43, 92, 0.15)',
+                      padding: '12px 16px',
+                      maxWidth: '85%',
                     } : {
                       backgroundColor: '#ffffff',
                       color: '#1f2937',
                       border: '1px solid #e5e7eb',
                       borderBottomLeftRadius: '4px',
                       boxShadow: '0 2px 8px rgba(0, 0, 0, 0.05)',
+                      padding: '20px 24px',
+                      maxWidth: '85%',
+                      width: 'fit-content',
+                      minWidth: '250px',
+                      marginBottom: '4px',
                     }}
                   >
-                    <p style={{ 
-                      margin: '0',
-                      fontSize: '14px',
-                      lineHeight: '1.5',
-                      whiteSpace: 'pre-wrap',
-                      wordBreak: 'break-word',
-                      color: message.role === 'user' ? '#ffffff' : '#1f2937',
-                      fontWeight: message.role === 'user' ? 400 : 400,
-                    }}>
-                      {message.content}
-                    </p>
+                    {message.role === 'assistant' ? (
+                      <div
+                        className="sit-w-full sit-text-slate-800"
+                        style={{
+                          margin: '0',
+                          fontSize: '15px',
+                          lineHeight: '1.6',
+                          whiteSpace: 'pre-wrap',
+                          wordBreak: 'break-word',
+                          overflowWrap: 'anywhere',
+                          color: theme.colors.textSecondary,
+                          fontWeight: 400,
+                          textAlign: 'left',
+                          fontFamily: '-apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif',
+                          maxWidth: '720px',
+                          width: '100%',
+                          display: 'block',
+                        }}
+                      >
+                        {message.content.replace(/\*\*/g, '')}
+                      </div>
+                    ) : (
+                      <p style={{ 
+                        margin: '0',
+                        fontSize: '14px',
+                        lineHeight: '1.6',
+                        whiteSpace: 'pre-wrap',
+                        wordBreak: 'break-word',
+                        color: '#ffffff',
+                        fontWeight: 400,
+                        textAlign: 'left',
+                      }}>
+                        {message.content}
+                      </p>
+                    )}
                   </div>
                   <span style={{ 
                     fontSize: '11px',
-                    color: '#9ca3af',
+                    color: theme.colors.textMuted,
                     margin: '0',
                     paddingLeft: message.role === 'user' ? '0' : '8px',
                     paddingRight: message.role === 'user' ? '8px' : '0',
@@ -794,65 +1248,157 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
                 </div>
               ))}
 
-              {/* Thinking Indicator - Shows after user message when loading */}
-              {isLoading && thinkingSteps.length > 0 && (
+              {/* Enhanced Thinking Indicator - Cursor-style minimal design (no card, clean and elegant) */}
+              {isLoading && thinkingStepObjects.length > 0 && (
+                <div className="sit-flex sit-flex-col sit-gap-1 sit-fade-in-up" style={{ alignItems: 'flex-start', width: '100%', padding: '6px 0' }}>
+                  {thinkingStepObjects.map((step, index) => {
+                    const isCompleted = index < thinkingStepIndex;
+                    const isCurrent = index === thinkingStepIndex;
+                    const isPending = index > thinkingStepIndex;
+
+                    return (
+                      <div
+                        key={index}
+                        className="sit-flex sit-items-center sit-gap-2.5 sit-transition-all sit-duration-200"
+                        style={{
+                          opacity: isPending ? 0.35 : 1,
+                          padding: '3px 0',
+                          width: '100%',
+                        }}
+                      >
+                        {/* Minimal Status Icon - Very subtle and clean */}
+                        <div className="sit-flex-shrink-0" style={{ width: '16px', height: '16px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                          {isCompleted ? (
+                            // Clean checkmark - minimal green check
+                            <svg
+                              width="14"
+                              height="14"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              style={{
+                                color: '#10b981',
+                                animation: 'sit-fade-in 0.2s ease-in',
+                              }}
+                            >
+                              <path
+                                d="M9 12l2 2 4-4"
+                                stroke="#10b981"
+                                strokeWidth="2.5"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                              />
+                            </svg>
+                          ) : isCurrent ? (
+                            // Subtle spinner - clean and minimal
+                            <div
+                              className="sit-rounded-full sit-border-2"
+                              style={{
+                                width: '14px',
+                                height: '14px',
+                                borderColor: theme.colors.primary,
+                                borderTopColor: 'transparent',
+                                borderWidth: '2px',
+                                animation: 'sit-spin 0.8s linear infinite',
+                              }}
+                            />
+                          ) : (
+                            // Very subtle empty circle for pending
+                            <div
+                              className="sit-rounded-full sit-border"
+                              style={{
+                                width: '14px',
+                                height: '14px',
+                                borderColor: '#d1d5db',
+                                borderWidth: '1.5px',
+                                backgroundColor: 'transparent',
+                                opacity: 0.4,
+                              }}
+                            />
+                          )}
+                        </div>
+
+                        {/* Step Text - Cursor-style clean typography */}
+                        <span
+                          style={{
+                            fontWeight: isCurrent ? 500 : 400,
+                            fontSize: '13px',
+                            color: isCompleted ? theme.colors.textMuted : isCurrent ? theme.colors.textPrimary : theme.colors.textMuted,
+                            lineHeight: '1.6',
+                            transition: 'all 0.2s ease',
+                            letterSpacing: '-0.01em',
+                            fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+                          }}
+                        >
+                          {step.text}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Fallback: Single step thinking indicator (backward compatibility) */}
+              {isLoading && thinkingStepObjects.length === 0 && thinkingSteps.length > 0 && (
                 <div className="sit-flex sit-flex-col sit-gap-1 sit-fade-in-up" style={{ alignItems: 'flex-start' }}>
                   <div
-                    className="sit-flex sit-items-center sit-gap-3 sit-py-3 sit-px-4 sit-rounded-2xl sit-text-sm sit-shadow-md"
+                    className="sit-flex sit-items-center sit-gap-3 sit-py-3 sit-px-4 sit-rounded-2xl sit-text-sm"
                     style={{
-                      backgroundColor: '#ffffff',
-                      color: '#1f2937 !important',
+                      backgroundColor: '#f9fafb',
+                      color: '#1f2937',
                       border: '1px solid #e5e7eb',
                       borderBottomLeftRadius: '4px',
                       maxWidth: '85%',
-                      boxShadow: '0 2px 8px rgba(0, 0, 0, 0.1)',
                     }}
                   >
-                    <div
-                      className="sit-flex sit-items-center sit-justify-center sit-rounded-full sit-flex-shrink-0"
-                      style={{
-                        width: '28px',
-                        height: '28px',
-                        background: 'rgba(0, 43, 92, 0.1)',
-                        border: '1px solid rgba(0, 43, 92, 0.2)',
-                      }}
-                    >
-                      <div
-                        className="sit-rounded-full"
-                        style={{
-                          width: '14px',
-                          height: '14px',
-                          border: '2.5px solid rgba(0, 43, 92, 0.2)',
-                          borderTopColor: '#002b5c',
-                          animation: 'sit-spin 0.9s linear infinite',
-                          borderRadius: '9999px'
-                        }}
-                      />
-                    </div>
-                    <div className="sit-flex sit-flex-col sit-gap-1.5" style={{ flex: 1 }}>
+                    <div className="sit-flex sit-items-center sit-gap-1.5" style={{ flex: 1 }}>
                       <span style={{ 
-                        fontWeight: 500, 
+                        fontWeight: 400, 
                         fontSize: '14px',
-                        color: '#1f2937 !important',
+                        color: '#6b7280',
                         lineHeight: '1.5',
                       }}>
                         {thinkingSteps[Math.min(thinkingStepIndex, thinkingSteps.length - 1)]}
                       </span>
-                      {thinkingSteps[thinkingStepIndex + 1] && thinkingStepIndex < thinkingSteps.length - 1 && (
-                        <span style={{ 
-                          fontSize: '12px', 
-                          color: '#6b7280 !important', 
-                          fontWeight: 400,
-                          lineHeight: '1.4',
-                        }}>
-                          Next: {thinkingSteps[thinkingStepIndex + 1]}
-                        </span>
-                      )}
+                      <div className="sit-flex sit-items-center sit-gap-1" style={{ marginLeft: '4px' }}>
+                        <span
+                          style={{
+                            width: '4px',
+                            height: '4px',
+                            backgroundColor: '#9ca3af',
+                            borderRadius: '50%',
+                            display: 'inline-block',
+                            animation: 'sit-thinking-dot 1.4s ease-in-out infinite',
+                            animationDelay: '0s',
+                          }}
+                        />
+                        <span
+                          style={{
+                            width: '4px',
+                            height: '4px',
+                            backgroundColor: '#9ca3af',
+                            borderRadius: '50%',
+                            display: 'inline-block',
+                            animation: 'sit-thinking-dot 1.4s ease-in-out infinite',
+                            animationDelay: '0.2s',
+                          }}
+                        />
+                        <span
+                          style={{
+                            width: '4px',
+                            height: '4px',
+                            backgroundColor: '#9ca3af',
+                            borderRadius: '50%',
+                            display: 'inline-block',
+                            animation: 'sit-thinking-dot 1.4s ease-in-out infinite',
+                            animationDelay: '0.4s',
+                          }}
+                        />
+                      </div>
                     </div>
                   </div>
                   <span style={{ 
                     fontSize: '11px',
-                    color: '#9ca3af',
+                    color: theme.colors.textMuted,
                     margin: '0',
                     paddingLeft: '8px',
                   }}>
@@ -865,42 +1411,58 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
               {isLoading && thinkingSteps.length === 0 && (
                 <div className="sit-flex sit-flex-col sit-gap-1 sit-fade-in-up" style={{ alignItems: 'flex-start' }}>
                   <div 
-                    className="sit-px-4 sit-py-3 sit-rounded-2xl sit-flex sit-items-center sit-gap-2 sit-border-0"
+                    className="sit-px-4 sit-py-3 sit-rounded-2xl sit-flex sit-items-center sit-gap-2"
                     style={{
-                      backgroundColor: '#ffffff',
+                      backgroundColor: '#f9fafb',
                       border: '1px solid #e5e7eb',
                       borderBottomLeftRadius: '4px',
                       width: 'fit-content',
-                      boxShadow: '0 2px 8px rgba(0, 0, 0, 0.05)',
                     }}
                   >
-                    <div className="sit-flex sit-gap-1">
-                      <span className="sit-animate-bounce" style={{
-                        width: '6px',
-                        height: '6px',
-                        backgroundColor: '#ff9900',
-                        borderRadius: '50%',
-                        display: 'inline-block',
-                        animationDelay: '0ms',
-                      }}></span>
-                      <span className="sit-animate-bounce" style={{
-                        width: '6px',
-                        height: '6px',
-                        backgroundColor: '#ff9900',
-                        borderRadius: '50%',
-                        display: 'inline-block',
-                        animationDelay: '150ms',
-                      }}></span>
-                      <span className="sit-animate-bounce" style={{
-                        width: '6px',
-                        height: '6px',
-                        backgroundColor: '#ff9900',
-                        borderRadius: '50%',
-                        display: 'inline-block',
-                        animationDelay: '300ms',
-                      }}></span>
+                    <div className="sit-flex sit-items-center sit-gap-1">
+                      <span
+                        style={{
+                          width: '4px',
+                          height: '4px',
+                          backgroundColor: '#9ca3af',
+                          borderRadius: '50%',
+                          display: 'inline-block',
+                          animation: 'sit-thinking-dot 1.4s ease-in-out infinite',
+                          animationDelay: '0s',
+                        }}
+                      />
+                      <span
+                        style={{
+                          width: '4px',
+                          height: '4px',
+                          backgroundColor: '#9ca3af',
+                          borderRadius: '50%',
+                          display: 'inline-block',
+                          animation: 'sit-thinking-dot 1.4s ease-in-out infinite',
+                          animationDelay: '0.2s',
+                        }}
+                      />
+                      <span
+                        style={{
+                          width: '4px',
+                          height: '4px',
+                          backgroundColor: '#9ca3af',
+                          borderRadius: '50%',
+                          display: 'inline-block',
+                          animation: 'sit-thinking-dot 1.4s ease-in-out infinite',
+                          animationDelay: '0.4s',
+                        }}
+                      />
                     </div>
                   </div>
+                  <span style={{ 
+                    fontSize: '11px',
+                    color: theme.colors.textMuted,
+                    margin: '0',
+                    paddingLeft: '8px',
+                  }}>
+                    {new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                  </span>
                 </div>
               )}
 
@@ -918,6 +1480,7 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
           >
             <div className="sit-flex sit-gap-2 sit-items-center">
               <input
+                ref={inputRef}
                 type="text"
                 value={inputValue}
                 onChange={(e) => setInputValue(e.target.value)}
@@ -926,40 +1489,143 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
                 disabled={isLoading}
                 className="sit-flex-1 sit-px-4 sit-py-3 sit-rounded-xl sit-border sit-transition-all sit-duration-200"
                 style={{ 
-                  borderColor: '#e5e7eb',
-                  backgroundColor: '#ffffff',
+                  borderColor: theme.colors.border,
+                  backgroundColor: theme.colors.background,
                   fontSize: '14px',
-                  color: '#1f2937',
+                  color: theme.colors.textPrimary,
                   outline: 'none',
                 }}
                 onFocus={(e) => {
-                  e.target.style.borderColor = '#002b5c';
-                  e.target.style.boxShadow = '0 0 0 3px rgba(0, 43, 92, 0.1)';
+                  e.target.style.borderColor = theme.colors.primary;
+                  e.target.style.boxShadow = `0 0 0 3px ${theme.colors.primary}1A`;
                 }}
                 onBlur={(e) => {
-                  e.target.style.borderColor = '#e5e7eb';
+                  e.target.style.borderColor = theme.colors.border;
                   e.target.style.boxShadow = 'none';
                 }}
               />
+              {/* Model Selector Dropdown - Compact */}
+              <div className="sit-relative" ref={modelDropdownRef}>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setIsModelDropdownOpen(!isModelDropdownOpen);
+                  }}
+                  className="sit-w-10 sit-h-10 sit-rounded-xl sit-flex sit-items-center sit-justify-center sit-cursor-pointer sit-transition-all sit-duration-200 sit-border"
+                  style={{ 
+                    backgroundColor: '#ffffff',
+                    borderColor: theme.colors.border,
+                    color: '#6b7280',
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.borderColor = theme.colors.primary;
+                    e.currentTarget.style.color = theme.colors.primary;
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.borderColor = theme.colors.border;
+                    e.currentTarget.style.color = theme.colors.textMuted;
+                  }}
+                  title={`AI Model: ${availableModels.find(m => m.value === selectedModel)?.label || selectedModel} (${aiProvider === 'ollama' ? 'Ollama' : 'Gemini'})`}
+                  aria-label="Change AI model"
+                >
+                  <ChevronDown size={16} strokeWidth={2.5} />
+                </button>
+                
+                {/* Dropdown Menu */}
+                {isModelDropdownOpen && (
+                  <div
+                    className="sit-absolute sit-right-0 sit-mb-1 sit-rounded-lg sit-shadow-lg sit-overflow-hidden sit-z-50"
+                    style={{
+                      backgroundColor: '#ffffff',
+                      border: '1px solid #e5e7eb',
+                      minWidth: '220px',
+                      boxShadow: '0 4px 12px rgba(0, 0, 0, 0.15)',
+                      bottom: '100%',
+                      marginBottom: '4px',
+                    }}
+                  >
+                    {availableModels.map((model) => (
+                      <button
+                        key={model.value}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setSelectedModel(model.value);
+                          setIsModelDropdownOpen(false);
+                          // Save model selection
+                          chrome.storage.local.set({ selectedAIModel: model.value });
+                          // Also save provider if switching between providers
+                          const modelProvider = ollamaModels.some(m => m.value === model.value) ? 'ollama' : 'gemini';
+                          if (modelProvider !== aiProvider) {
+                            setAiProvider(modelProvider);
+                            chrome.storage.local.set({ aiProvider: modelProvider });
+                          }
+                        }}
+                        className="sit-w-full sit-text-left sit-px-3 sit-py-2.5 sit-cursor-pointer sit-border-0 sit-transition-colors"
+                        style={{
+                          backgroundColor: selectedModel === model.value ? '#f3f4f6' : '#ffffff',
+                          color: '#1f2937',
+                          fontSize: '13px',
+                          borderBottom: '1px solid #f3f4f6',
+                        }}
+                        onMouseEnter={(e) => {
+                          if (selectedModel !== model.value) {
+                            e.currentTarget.style.backgroundColor = '#f9fafb';
+                          }
+                        }}
+                        onMouseLeave={(e) => {
+                          if (selectedModel !== model.value) {
+                            e.currentTarget.style.backgroundColor = '#ffffff';
+                          }
+                        }}
+                      >
+                        <div className="sit-flex sit-items-center sit-justify-between">
+                          <div className="sit-flex sit-flex-col">
+                            <span style={{ fontWeight: selectedModel === model.value ? '600' : '500', fontSize: '13px' }}>
+                              {model.label}
+                            </span>
+                            <span style={{ fontSize: '11px', color: '#6b7280', marginTop: '2px' }}>
+                              {model.description}
+                            </span>
+                          </div>
+                          {selectedModel === model.value && (
+                            <span style={{ color: '#002b5c', fontSize: '14px', fontWeight: '600' }}>✓</span>
+                          )}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
               <button
                 onClick={sendMessage}
                 disabled={isLoading || !inputValue.trim()}
                 className="sit-w-10 sit-h-10 sit-rounded-xl sit-flex sit-items-center sit-justify-center sit-cursor-pointer sit-transition-all sit-duration-200 sit-border-0"
                 style={{ 
-                  backgroundColor: inputValue.trim() && !isLoading ? '#ff9900' : '#e5e7eb',
-                  color: inputValue.trim() && !isLoading ? '#ffffff' : '#9ca3af',
+                  backgroundColor: inputValue.trim() && !isLoading ? theme.colors.secondary : theme.colors.border,
+                  color: inputValue.trim() && !isLoading ? '#ffffff' : theme.colors.textMuted,
                   opacity: isLoading ? '0.6' : '1',
                   cursor: (!inputValue.trim() || isLoading) ? 'not-allowed' : 'pointer',
                 }}
                 onMouseEnter={(e) => {
                   if (inputValue.trim() && !isLoading) {
-                    e.currentTarget.style.backgroundColor = '#e68a00';
+                    // Darken secondary color by ~10%
+                    const darkenColor = (color: string) => {
+                      if (color.startsWith('#')) {
+                        const num = parseInt(color.replace('#', ''), 16);
+                        const r = Math.max(0, (num >> 16) - 20);
+                        const g = Math.max(0, ((num >> 8) & 0x00FF) - 20);
+                        const b = Math.max(0, (num & 0x0000FF) - 20);
+                        return `#${((r << 16) | (g << 8) | b).toString(16).padStart(6, '0')}`;
+                      }
+                      return color;
+                    };
+                    e.currentTarget.style.backgroundColor = darkenColor(theme.colors.secondary);
                     e.currentTarget.style.transform = 'scale(1.05)';
                   }
                 }}
                 onMouseLeave={(e) => {
                   if (inputValue.trim() && !isLoading) {
-                    e.currentTarget.style.backgroundColor = '#ff9900';
+                    e.currentTarget.style.backgroundColor = theme.colors.secondary;
                     e.currentTarget.style.transform = 'scale(1)';
                   }
                 }}
@@ -969,14 +1635,504 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
             </div>
             <p style={{
               margin: '8px 0 0 0',
+              paddingLeft: '0',
               fontSize: '11px',
-              color: '#9ca3af',
+              color: theme.colors.textMuted,
               textAlign: 'left',
+              width: '100%',
             }}>
-              Powered by Service IT+ AI
+              Powered by Service IT
             </p>
           </div>
         </div>
+      )}
+
+      {/* Settings Dialog - Modern, Clean Design */}
+      {isSettingsOpen && isOpen && (
+        <div
+          className="sit-fixed sit-rounded-2xl sit-flex sit-flex-col sit-overflow-hidden sit-pointer-events-auto"
+          style={{
+            width: `${Math.min(widgetWidth, 420)}px`,
+            maxHeight: '500px',
+            backgroundColor: '#ffffff',
+            zIndex: 2147483647, // Above chat widget
+            boxShadow: '0 20px 60px rgba(0, 0, 0, 0.15), 0 0 0 1px rgba(0, 0, 0, 0.05)',
+            border: 'none',
+            minWidth: '320px',
+            maxWidth: '420px',
+            right: `${widgetWidth + 40}px`, // Position to the left of chat widget with 40px gap
+            top: `calc(100vh - 600px - 20px)`, // Align with top of chat widget (600px height + 20px bottom margin)
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {/* Settings Header */}
+          <div
+            className="sit-px-5 sit-py-4 sit-flex sit-items-center sit-justify-between sit-border-0"
+            style={{ 
+              backgroundColor: theme.colors.primary,
+              color: '#ffffff',
+              borderBottom: '1px solid rgba(255, 255, 255, 0.1)',
+            }}
+          >
+            <div className="sit-flex sit-items-center sit-gap-3" style={{ color: '#ffffff' }}>
+              <Settings 
+                size={20} 
+                strokeWidth={2}
+              />
+              <span style={{ 
+                color: '#ffffff',
+                fontWeight: '600',
+                fontSize: '15px',
+                lineHeight: '1.3',
+                margin: '0',
+              }}>
+                Settings
+              </span>
+            </div>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                setIsSettingsOpen(false);
+              }}
+              className="sit-w-8 sit-h-8 sit-rounded-lg sit-flex sit-items-center sit-justify-center sit-cursor-pointer sit-transition-all sit-duration-200 sit-border-0"
+              style={{ 
+                backgroundColor: 'transparent',
+                color: '#ffffff',
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.15)';
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.backgroundColor = 'transparent';
+              }}
+            >
+              <X size={20} strokeWidth={2} />
+            </button>
+          </div>
+
+          {/* Settings Content */}
+          <div 
+            className="sit-flex-1 sit-overflow-y-auto"
+            style={{ 
+              backgroundColor: '#ffffff',
+            }}
+          >
+            <div className="sit-flex sit-flex-col">
+              {/* Themes Section */}
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setTempTheme(theme); // Initialize temp theme with current theme
+                  setIsThemeEditorOpen(true);
+                }}
+                className="sit-w-full sit-flex sit-items-center sit-justify-between sit-px-5 sit-py-3.5 sit-cursor-pointer sit-border-0 sit-transition-colors"
+                style={{
+                  backgroundColor: 'transparent',
+                  borderBottom: '1px solid #f3f4f6',
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.backgroundColor = '#f9fafb';
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.backgroundColor = 'transparent';
+                }}
+              >
+                <div className="sit-flex sit-items-center sit-gap-2">
+                  <Palette size={16} strokeWidth={2} color="#6b7280" />
+                  <span style={{ 
+                    color: '#1f2937',
+                    fontWeight: '600',
+                    fontSize: '14px',
+                  }}>
+                    Customize Theme
+                  </span>
+                </div>
+                <ChevronRight 
+                  size={16} 
+                  strokeWidth={2}
+                  color="#6b7280"
+                />
+              </button>
+
+              {/* Widget Width Control - Collapsible */}
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setIsWidgetWidthExpanded(!isWidgetWidthExpanded);
+                }}
+                className="sit-w-full sit-flex sit-items-center sit-justify-between sit-px-5 sit-py-3.5 sit-cursor-pointer sit-border-0 sit-transition-colors"
+                style={{
+                  backgroundColor: 'transparent',
+                  borderBottom: '1px solid #f3f4f6',
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.backgroundColor = '#f9fafb';
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.backgroundColor = 'transparent';
+                }}
+              >
+                <span style={{ 
+                  color: '#1f2937',
+                  fontWeight: '600',
+                  fontSize: '14px',
+                }}>
+                  Widget Width
+                </span>
+                <div className="sit-flex sit-items-center sit-gap-2">
+                  <span style={{ 
+                    color: '#6b7280',
+                    fontSize: '13px',
+                    fontWeight: '500',
+                  }}>
+                    {widgetWidth}px
+                  </span>
+                  <ChevronRight 
+                    size={16} 
+                    strokeWidth={2}
+                    color="#6b7280"
+                    style={{
+                      transform: isWidgetWidthExpanded ? 'rotate(90deg)' : 'rotate(0deg)',
+                      transition: 'transform 0.2s ease',
+                    }}
+                  />
+                </div>
+              </button>
+              
+              {/* Widget Width Content - Collapsible */}
+              {isWidgetWidthExpanded && (
+                <div className="sit-px-5 sit-py-4 sit-border-b" style={{ borderBottom: '1px solid #f3f4f6', backgroundColor: '#f9fafb' }}>
+                  <div className="sit-flex sit-items-center sit-gap-3 sit-mb-3">
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setWidgetWidth(prev => Math.max(300, prev - 50));
+                      }}
+                      className="sit-cursor-pointer sit-border-0 sit-rounded-lg sit-flex sit-items-center sit-justify-center"
+                      style={{
+                        width: '36px',
+                        height: '36px',
+                        backgroundColor: '#ffffff',
+                        border: '1px solid #e5e7eb',
+                        color: '#1f2937',
+                        fontSize: '18px',
+                        fontWeight: '600',
+                        transition: 'all 0.2s',
+                      }}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.borderColor = '#002b5c';
+                        e.currentTarget.style.backgroundColor = '#f9fafb';
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.borderColor = '#e5e7eb';
+                        e.currentTarget.style.backgroundColor = '#ffffff';
+                      }}
+                      title="Decrease width"
+                      aria-label="Decrease width"
+                    >
+                      −
+                    </button>
+                    <div className="sit-flex-1 sit-h-2 sit-rounded-full" style={{ backgroundColor: '#e5e7eb' }}>
+                      <div 
+                        className="sit-h-full sit-rounded-full sit-transition-all"
+                        style={{ 
+                          backgroundColor: theme.colors.primary,
+                          width: `${((widgetWidth - 300) / (800 - 300)) * 100}%`,
+                          minWidth: '4px',
+                        }}
+                      />
+                    </div>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setWidgetWidth(prev => Math.min(window.innerWidth - 40, 800, prev + 50));
+                      }}
+                      className="sit-cursor-pointer sit-border-0 sit-rounded-lg sit-flex sit-items-center sit-justify-center"
+                      style={{
+                        width: '36px',
+                        height: '36px',
+                        backgroundColor: '#ffffff',
+                        border: '1px solid #e5e7eb',
+                        color: '#1f2937',
+                        fontSize: '18px',
+                        fontWeight: '600',
+                        transition: 'all 0.2s',
+                      }}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.borderColor = '#002b5c';
+                        e.currentTarget.style.backgroundColor = '#f9fafb';
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.borderColor = '#e5e7eb';
+                        e.currentTarget.style.backgroundColor = '#ffffff';
+                      }}
+                      title="Increase width"
+                      aria-label="Increase width"
+                    >
+                      +
+                    </button>
+                  </div>
+                  <span style={{ 
+                    color: '#6b7280',
+                    fontSize: '12px',
+                  }}>
+                    Adjust the width of the chat widget (300px - 800px)
+                  </span>
+                </div>
+              )}
+
+              {/* Clear Conversation - 2025 BEST PRACTICE: User-controlled data deletion */}
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  clearConversation();
+                  setIsSettingsOpen(false);
+                }}
+                className="sit-w-full sit-flex sit-items-center sit-justify-between sit-px-5 sit-py-3.5 sit-cursor-pointer sit-border-0 sit-transition-colors"
+                style={{
+                  backgroundColor: 'transparent',
+                  borderBottom: '1px solid #f3f4f6',
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.backgroundColor = '#fef2f2';
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.backgroundColor = 'transparent';
+                }}
+              >
+                <span style={{ 
+                  color: '#dc2626',
+                  fontWeight: '600',
+                  fontSize: '14px',
+                }}>
+                  Clear Conversation
+                </span>
+                <span style={{ 
+                  color: theme.colors.textMuted,
+                  fontSize: '12px',
+                }}>
+                  Start fresh
+                </span>
+              </button>
+
+              {/* Export Chat - Collapsible */}
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setIsExportChatExpanded(!isExportChatExpanded);
+                }}
+                className="sit-w-full sit-flex sit-items-center sit-justify-between sit-px-5 sit-py-3.5 sit-cursor-pointer sit-border-0 sit-transition-colors"
+                style={{
+                  backgroundColor: 'transparent',
+                  borderBottom: '1px solid #f3f4f6',
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.backgroundColor = '#f9fafb';
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.backgroundColor = 'transparent';
+                }}
+              >
+                <span style={{ 
+                  color: '#1f2937',
+                  fontWeight: '600',
+                  fontSize: '14px',
+                }}>
+                  Export Chat
+                </span>
+                <ChevronRight 
+                  size={16} 
+                  strokeWidth={2}
+                  color="#6b7280"
+                  style={{
+                    transform: isExportChatExpanded ? 'rotate(90deg)' : 'rotate(0deg)',
+                    transition: 'transform 0.2s ease',
+                  }}
+                />
+              </button>
+              
+              {/* Export Chat Content - Collapsible */}
+              {isExportChatExpanded && (
+                <div className="sit-px-5 sit-py-4 sit-border-b" style={{ borderBottom: '1px solid #f3f4f6', backgroundColor: '#f9fafb' }}>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      exportChat();
+                    }}
+                    className="sit-w-full sit-px-4 sit-py-3 sit-rounded-xl sit-text-sm sit-font-semibold sit-cursor-pointer sit-transition-all sit-duration-200 sit-border-0 sit-mb-2"
+                    style={{
+                      backgroundColor: theme.colors.primary,
+                      color: '#ffffff',
+                      textAlign: 'center',
+                      boxShadow: '0 2px 8px rgba(0, 43, 92, 0.15)',
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.backgroundColor = '#001a3d';
+                      e.currentTarget.style.boxShadow = '0 4px 12px rgba(0, 43, 92, 0.25)';
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.backgroundColor = '#002b5c';
+                      e.currentTarget.style.boxShadow = '0 2px 8px rgba(0, 43, 92, 0.15)';
+                    }}
+                  >
+                    Export Conversation
+                  </button>
+                  <span style={{ 
+                    color: '#6b7280',
+                    fontSize: '12px',
+                  }}>
+                    Download your chat history as a text file
+                  </span>
+                </div>
+              )}
+
+              {/* Customer Service Section - Clean, Modern Card Design */}
+              <div 
+                className="sit-mx-5 sit-my-4 sit-p-5 sit-rounded-xl"
+                style={{ 
+                  backgroundColor: '#f9fafb',
+                  border: '1px solid #e5e7eb',
+                }}
+              >
+                <div className="sit-flex sit-items-start sit-gap-4 sit-mb-4">
+                  <div 
+                    className="sit-w-12 sit-h-12 sit-rounded-xl sit-flex sit-items-center sit-justify-center sit-flex-shrink-0"
+                    style={{ 
+                      backgroundColor: theme.colors.primary,
+                    }}
+                  >
+                    <div style={{ color: '#ffffff' }}>
+                      <Mail 
+                        size={20} 
+                        strokeWidth={2.5}
+                      />
+                    </div>
+                  </div>
+                  <div className="sit-flex-1">
+                    <div style={{ 
+                      color: theme.colors.primary, 
+                      fontWeight: '700', 
+                      fontSize: '15px',
+                      marginBottom: '4px'
+                    }}>
+                      Need Help?
+                    </div>
+                    <br />
+                    <div style={{ 
+                      color: '#6b7280', 
+                      fontSize: '13px',
+                      lineHeight: '1.5'
+                    }}>
+                      Our support team is ready to assist you. Send us an email and we'll respond promptly.
+                    </div>
+                  </div>
+                </div>
+                
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    window.open('mailto:support@serviceitplus.com', '_blank');
+                    setIsSettingsOpen(false);
+                  }}
+                  className="sit-w-full sit-px-4 sit-py-3 sit-rounded-xl sit-text-sm sit-font-semibold sit-cursor-pointer sit-transition-all sit-duration-200 sit-border-0 sit-flex sit-items-center sit-justify-center sit-gap-2"
+                  style={{
+                    backgroundColor: '#ff9900',
+                    color: '#ffffff',
+                    boxShadow: '0 2px 8px rgba(255, 153, 0, 0.2)',
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.backgroundColor = '#e68a00';
+                    e.currentTarget.style.boxShadow = '0 4px 12px rgba(255, 153, 0, 0.3)';
+                    e.currentTarget.style.transform = 'translateY(-1px)';
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.backgroundColor = '#ff9900';
+                    e.currentTarget.style.boxShadow = '0 2px 8px rgba(255, 153, 0, 0.2)';
+                    e.currentTarget.style.transform = 'translateY(0)';
+                  }}
+                >
+                  <div style={{ color: '#ffffff' }}>
+                    <Mail 
+                      size={16} 
+                      strokeWidth={2.5}
+                    />
+                  </div>
+                  <span style={{ color: '#ffffff' }}>Contact Support</span>
+                </button>
+                
+                <div 
+                  className="sit-mt-3 sit-px-3 sit-py-2 sit-rounded-lg"
+                  style={{ 
+                    backgroundColor: '#ffffff',
+                    border: '1px solid #e5e7eb',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px'
+                  }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    navigator.clipboard.writeText('support@serviceitplus.com').then(() => {
+                      // Optional: Show toast notification
+                    });
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.backgroundColor = '#f3f4f6';
+                    e.currentTarget.style.cursor = 'pointer';
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.backgroundColor = '#ffffff';
+                  }}
+                >
+                  <Mail size={14} strokeWidth={2} color="#6b7280" />
+                  <span style={{ 
+                    color: '#374151',
+                    fontSize: '13px',
+                    fontFamily: 'monospace',
+                    fontWeight: '500'
+                  }}>
+                    support@serviceitplus.com
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Overlay to close settings when clicking outside */}
+      {isSettingsOpen && isOpen && (
+        <div
+          className="sit-fixed sit-inset-0"
+          style={{
+            zIndex: 2147483646, // Below settings but above chat
+            backgroundColor: 'transparent',
+            pointerEvents: 'auto',
+          }}
+          onClick={(e) => {
+            e.stopPropagation();
+            setIsSettingsOpen(false);
+          }}
+        />
+      )}
+
+      {/* Theme Editor Modal */}
+      {isThemeEditorOpen && (
+        <ThemeEditor
+          currentTheme={theme}
+          tempTheme={tempTheme}
+          onTempThemeChange={setTempTheme}
+          onSave={() => {
+            setTheme(tempTheme);
+            setIsThemeEditorOpen(false);
+          }}
+          onCancel={() => {
+            setTempTheme(theme); // Reset temp theme to current theme
+            setIsThemeEditorOpen(false);
+          }}
+          onReset={() => {
+            setTempTheme(DEFAULT_THEME);
+          }}
+        />
       )}
     </>
   );

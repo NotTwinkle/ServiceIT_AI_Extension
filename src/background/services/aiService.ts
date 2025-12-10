@@ -8,10 +8,15 @@
 import { AI_CONFIG } from '../config';
 import { IvantiUser } from './userIdentity';
 import { fetchIvantiData, createIncident, updateIncident, deleteIncident, getIncidentRecId } from './ivantiDataService';
+import { correctTypos } from './typoCorrection';
+import { manageConversation, extractConversationKeyInfo } from './conversationManager';
+import { getRelevantDocumentation, formatDocumentationForContext } from './ivantiDocumentation';
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
   content: string;
+  timestamp?: number; // For tracking message age
+  summary?: string; // For older messages that have been summarized
 }
 
 export interface AIResponse {
@@ -26,6 +31,82 @@ export interface IvantiAction {
   description: string;
   requiresConfirmation?: boolean;
 }
+
+/**
+ * Build conversation state summary for system prompt
+ * 2025 BEST PRACTICE: Explicitly inform AI about conversation flow
+ */
+function buildConversationState(history: ChatMessage[], currentMessage: string): string {
+  if (history.length === 0) {
+    return 'CONVERSATION STATE: This is the start of a new conversation.';
+  }
+  
+  const userMessages = history.filter(m => m.role === 'user');
+  const assistantMessages = history.filter(m => m.role === 'assistant');
+  const turnNumber = userMessages.length + 1;
+  
+  // Get the last exchange
+  const lastUser = userMessages[userMessages.length - 1]?.content || '';
+  const lastAssistant = assistantMessages[assistantMessages.length - 1]?.content || '';
+  
+  // Check if current message is a follow-up (short, refers to previous context)
+  const isFollowUp = 
+    currentMessage.length < 100 && (
+      currentMessage.toLowerCase().includes('it') ||
+      currentMessage.toLowerCase().includes('that') ||
+      currentMessage.toLowerCase().includes('this') ||
+      currentMessage.toLowerCase().includes('them') ||
+      currentMessage.toLowerCase().includes('their') ||
+      currentMessage.toLowerCase().includes('what about') ||
+      currentMessage.toLowerCase().includes('and') ||
+      currentMessage.toLowerCase().startsWith('how') ||
+      currentMessage.toLowerCase().startsWith('why') ||
+      currentMessage.toLowerCase().startsWith('when') ||
+      currentMessage.toLowerCase().startsWith('where') ||
+      currentMessage.toLowerCase().startsWith('can you')
+    );
+  
+  const parts = [
+    `CONVERSATION STATE: Turn #${turnNumber} of this conversation.`
+  ];
+  
+  if (lastUser && lastAssistant) {
+    parts.push(`Previous exchange: User asked about "${lastUser.substring(0, 80)}${lastUser.length > 80 ? '...' : ''}" and you responded with information about ${extractMainTopic(lastAssistant)}.`);
+  }
+  
+  if (isFollowUp) {
+    parts.push(`IMPORTANT: The current message appears to be a FOLLOW-UP question referring to the previous exchange. Use context from your previous response to answer this question. Do NOT ask "What would you like me to do?" - instead, continue the conversation naturally based on context.`);
+  }
+  
+  return parts.join(' ');
+}
+
+/**
+ * Extract main topic from AI response for context tracking
+ */
+function extractMainTopic(response: string): string {
+  const lower = response.toLowerCase();
+  
+  if (lower.includes('incident') || lower.includes('ticket')) {
+    const ticketMatch = response.match(/#?(\d{5,})/);
+    return ticketMatch ? `incident #${ticketMatch[1]}` : 'incidents/tickets';
+  }
+  
+  if (lower.includes('user') || lower.includes('employee')) {
+    const nameMatch = response.match(/([A-Z][a-z]+ [A-Z][a-z]+)/);
+    return nameMatch ? `user ${nameMatch[1]}` : 'users/employees';
+  }
+  
+  if (lower.includes('service request')) return 'service requests';
+  if (lower.includes('category') || lower.includes('categories')) return 'categories';
+  if (lower.includes('service') || lower.includes('services')) return 'services';
+  if (lower.includes('team') || lower.includes('teams')) return 'teams';
+  if (lower.includes('department')) return 'departments';
+  
+  return 'Ivanti data';
+}
+
+// Note: createConversationSummary moved to conversationManager.ts for better organization
 
 /**
  * Detect if the AI is hallucinating data (making up RecIds, emails, etc.)
@@ -71,7 +152,63 @@ function detectHallucinations(aiResponse: string, actualData: string): string[] 
     }
   }
   
+  // Check for incident counts that don't match fetched data
+  const countMatches = aiResponse.match(/(?:you have|I found|there are|showing|listing)\s+(\d+)\s+incidents?/i);
+  if (countMatches) {
+    const claimedCount = parseInt(countMatches[1], 10);
+    // Count actual incidents in the data
+    const actualIncidentMatches = actualData.match(/Incident[#\s]+(\d{4,})/gi);
+    const actualCount = actualIncidentMatches ? actualIncidentMatches.length : 0;
+    
+    if (claimedCount !== actualCount && actualCount > 0) {
+      warnings.push(`AI claimed ${claimedCount} incidents but data only contains ${actualCount}`);
+    }
+  }
+  
+  // Check for "you have X incidents" when no incidents are in the data
+  if (aiResponse.match(/you have \d+ incidents?/i)) {
+    if (!actualData.match(/Incident[#\s]+(\d{4,})/i)) {
+      warnings.push('AI claimed user has incidents but no incidents found in fetched data');
+    }
+  }
+  
   return warnings;
+}
+
+/**
+ * Generate a safe response from actual fetched data when AI hallucinates
+ * This extracts real data from ivantiContext and formats it safely
+ */
+function generateSafeResponseFromData(ivantiContext: string, _userMessage: string): string | null {
+  if (!ivantiContext) return null;
+  
+  // Extract incidents from context
+  const incidentsSnippet = extractIncidentsSnippet(ivantiContext);
+  if (incidentsSnippet) {
+    // Count actual incidents in the snippet
+    const incidentMatches = incidentsSnippet.match(/Incident[#\s]+(\d{4,})/gi);
+    const incidentCount = incidentMatches ? incidentMatches.length : 0;
+    
+    if (incidentCount > 0) {
+      return `Here are the incidents I found in the system:\n\n${incidentsSnippet}\n\n(Found ${incidentCount} incident${incidentCount > 1 ? 's' : ''} total)`;
+    }
+  }
+  
+  // If no incidents snippet, try to extract any data sections
+  if (ivantiContext.includes('[DATA FETCHED FROM IVANTI')) {
+    // Extract the data section
+    const dataStart = ivantiContext.indexOf('[DATA FETCHED FROM IVANTI');
+    const dataEnd = ivantiContext.indexOf('\n[', dataStart + 1);
+    const dataSection = dataEnd > 0 
+      ? ivantiContext.substring(dataStart, dataEnd)
+      : ivantiContext.substring(dataStart);
+    
+    if (dataSection && dataSection.length > 50) {
+      return `Based on the data I retrieved from Ivanti:\n\n${dataSection.substring(0, 2000)}`;
+    }
+  }
+  
+  return null;
 }
 
 /**
@@ -161,18 +298,250 @@ function isLikelyNameFollowUp(userMessage: string, history: ChatMessage[]): bool
 /**
  * Process a user message and generate an AI response using Gemini
  */
+/**
+ * Detect if input is out-of-scope (not related to Ivanti Service Manager)
+ * Returns true if query appears to be about general topics, not Ivanti ITSM
+ * 2025 INDUSTRY BEST PRACTICE: Early scope detection to prevent unnecessary processing
+ * 
+ * @param input - User input message
+ * @param conversationHistory - Optional conversation history to check for context
+ */
+function isOutOfScope(input: string, conversationHistory?: ChatMessage[]): boolean {
+  const lower = input.toLowerCase().trim();
+  
+  // Empty or very short inputs are handled elsewhere
+  if (lower.length < 3) return false;
+  
+  // Always in-scope: direct Ivanti-related and ITSM terms
+  // These terms indicate the query is about Ivanti Service Manager or IT Service Management
+  const alwaysInScopeTerms = [
+    // Ivanti-specific
+    'ivanti', 'servicemanager', 'heat', 'neurons', 'serviceit',
+    // Core ITSM concepts
+    'incident', 'ticket', 'service request', 'sr#', 'incident#', 'ticket#',
+    'problem', 'change', 'request', 'service catalog', 'catalog',
+    // User/People management
+    'user', 'employee', 'people', 'staff', 'analyst', 'agent',
+    // Ticket properties
+    'category', 'priority', 'status', 'state', 'severity', 'urgency', 'impact',
+    'assigned', 'owner', 'assignee', 'reporter', 'requester',
+    // Organizational structure
+    'team', 'department', 'group', 'organization', 'org',
+    // Actions
+    'create', 'update', 'edit', 'modify', 'resolve', 'close', 'open', 'assign',
+    'approve', 'reject', 'escalate', 'reopen',
+    // Queries
+    'find', 'search', 'show', 'list', 'get', 'fetch', 'display', 'view',
+    'my tickets', 'my incidents', 'my requests',
+    // ITIL/ITSM concepts
+    'itil', 'itsm', 'service desk', 'help desk', 'support', 'tier',
+    'sla', 'service level', 'breach', 'response time',
+    // Configuration
+    'configuration', 'config', 'setting', 'preference', 'option',
+    // Reports/Analytics
+    'report', 'dashboard', 'metric', 'statistic', 'analytics', 'kpi'
+  ];
+  
+  // If input contains any in-scope term, it's likely in-scope
+  const hasInScopeTerm = alwaysInScopeTerms.some(term => lower.includes(term));
+  if (hasInScopeTerm) {
+    return false; // Definitely in-scope
+  }
+  
+  // Check conversation history for recent Ivanti context
+  // If previous messages discussed Ivanti topics, follow-ups are likely in-scope
+  if (conversationHistory && conversationHistory.length > 0) {
+    const recentMessages = conversationHistory.slice(-5); // Check last 5 messages
+    const hasRecentIvantiContext = recentMessages.some(msg => {
+      if (!msg.content) return false;
+      const content = msg.content.toLowerCase();
+      return alwaysInScopeTerms.some(term => content.includes(term));
+    });
+    
+    // If there's recent Ivanti context, be lenient (likely follow-up question)
+    if (hasRecentIvantiContext) {
+      return false;
+    }
+  }
+  
+  // Common out-of-scope topics (weather, general knowledge, entertainment, etc.)
+  const outOfScopeKeywords = [
+    // Weather
+    'weather', 'temperature', 'rain', 'snow', 'forecast', 'sunny', 'cloudy', 'humidity',
+    // General knowledge/trivia
+    'tell me a joke', 'joke', 'funny story', 'what is the capital of', 'who won',
+    'what happened in history', 'explain quantum physics', 'how does ai work',
+    'explain machine learning', 'what is blockchain',
+    // Entertainment
+    'movie', 'watch movie', 'music', 'song', 'actor', 'actress', 'celebrity',
+    'sports', 'play game', 'video game',
+    // General web search topics
+    'google this', 'search the web', 'find on internet', 'look up online',
+    'what is on google', 'google search',
+    // General AI chat topics
+    'write a poem', 'write code', 'generate image', 'create art', 'write a story',
+    'write an essay', 'write code for',
+    // Time/date (unless related to incidents)
+    /^what\s+time\s+is\s+it$/i, /^what\s+date\s+is\s+it$/i, 'current time',
+    'time zone', 'what time is it now',
+    // Math/calculations (unless ticket numbers)
+    'calculate', 'solve equation', 'math problem', 'what is 2+2',
+    // Cooking/recipes
+    'recipe', 'how to cook', 'baking', 'how to make food',
+    // Travel
+    'flights', 'hotels', 'travel', 'vacation', 'tourism', 'book a flight',
+    // Health/medical
+    'medical symptoms', 'diagnosis', 'medicine', 'health advice', 'should i see a doctor',
+    // Personal advice
+    'relationship advice', 'dating advice', 'personal problem', 'therapy'
+  ];
+  
+  // Check if input matches out-of-scope patterns
+  for (const keyword of outOfScopeKeywords) {
+    if (typeof keyword === 'string') {
+      if (lower.includes(keyword)) {
+        return true; // Out of scope
+      }
+    } else if (keyword instanceof RegExp) {
+      if (keyword.test(lower)) {
+        return true; // Out of scope
+      }
+    }
+  }
+  
+  // Check for question patterns that suggest general knowledge queries
+  // But only if no Ivanti context is present
+  const generalKnowledgePatterns = [
+    /^(what|who|where|when|why|how)\s+(is|are|was|were|does|do|did|will|can|could|should)\s+(the|a|an)\s+[^?]*\?$/i,
+    /^tell\s+me\s+(about|more\s+about)\s+[^?]*\?$/i,
+    /^(explain|describe|define)\s+[^?]*\?$/i
+  ];
+  
+  for (const pattern of generalKnowledgePatterns) {
+    if (pattern.test(lower)) {
+      // Double-check: make sure it's not about Ivanti
+      const ivantiTerms = ['ivanti', 'incident', 'ticket', 'service request', 'user', 'employee'];
+      const hasIvantiTerm = ivantiTerms.some(term => lower.includes(term));
+      
+      if (!hasIvantiTerm) {
+        return true; // Likely out of scope
+      }
+    }
+  }
+  
+  // Greetings are always fine (handled in response)
+  const greetings = ['hello', 'hi', 'hey', 'good morning', 'good afternoon', 'good evening', 'thanks', 'thank you'];
+  const isOnlyGreeting = greetings.some(g => lower === g || lower === g + '!' || lower.startsWith(g + ' '));
+  if (isOnlyGreeting) {
+    return false; // Greetings are in-scope, we handle them helpfully
+  }
+  
+  return false;
+}
+
+/**
+ * Detect if input is likely gibberish/nonsensical
+ * Returns true if input appears to be random characters, not meaningful text
+ * 2025 INDUSTRY BEST PRACTICE: Early validation to prevent unnecessary LLM API calls
+ */
+function isGibberish(input: string): boolean {
+  const trimmed = input.trim();
+  
+  // Too short to be meaningful (but allow single words that might be valid)
+  if (trimmed.length < 2) return false;
+  
+  // Check for excessive repetition (e.g., "aaaaa", "123123123")
+  const chars = trimmed.split('');
+  const uniqueChars = new Set(chars).size;
+  if (uniqueChars / chars.length < 0.3 && trimmed.length > 5) {
+    return true; // Less than 30% unique characters = likely gibberish
+  }
+  
+  // Check for patterns that look random (consonant clusters, no vowels)
+  // English words typically have vowels - random strings often don't
+  const vowels = /[aeiouAEIOU]/g;
+  const vowelCount = (trimmed.match(vowels) || []).length;
+  const vowelRatio = vowelCount / trimmed.length;
+  
+  // If longer than 5 chars and has < 10% vowels, likely gibberish
+  if (trimmed.length > 5 && vowelRatio < 0.1) {
+    return true;
+  }
+  
+  // Check for excessive consonant clusters (3+ consonants in a row is unusual in English)
+  const consonantClusters = /[bcdfghjklmnpqrstvwxyzBCDFGHJKLMNPQRSTVWXYZ]{4,}/g;
+  if (consonantClusters.test(trimmed)) {
+    // But allow if it contains any common English words
+    const commonWords = /\b(the|and|for|are|but|not|you|all|can|her|was|one|our|out|day|get|has|him|his|how|man|new|now|old|see|two|way|who|boy|did|its|let|put|say|she|too|use)/i;
+    if (!commonWords.test(trimmed)) {
+      return true; // Has excessive consonant clusters and no common words
+    }
+  }
+  
+  // Check for completely random character patterns (all lowercase, no spaces, no punctuation)
+  // But skip if it's just a single word that might be valid
+  if (trimmed.length > 8 && !/\s/.test(trimmed) && /^[a-z]+$/.test(trimmed)) {
+    // Check if it has any meaningful letter combinations
+    const commonLetterPairs = /(th|he|in|er|an|re|ed|nd|on|en|at|ou|it|is|or|ti|as|to|nt|ng|st|ar|al|ic|le|co|de|el|li|ch|se|me|ne|ve|te|ce|ne|re|le|ge|ke|pe|we|ye|ze)/i;
+    if (!commonLetterPairs.test(trimmed)) {
+      return true; // Long string with no common letter pairs = likely gibberish
+    }
+  }
+  
+  return false;
+}
+
 export async function processMessage(
   userMessage: string,
   currentUser: IvantiUser,
   ticketId: string | null,
-  conversationHistory: ChatMessage[]
+  conversationHistory: ChatMessage[],
+  model?: string
 ): Promise<AIResponse> {
   try {
     console.log('[AI Service] Processing message with Gemini:', userMessage);
 
+    // 2025 INDUSTRY BEST PRACTICE: Early input validation to detect gibberish
+    // This prevents expensive operations (API calls, data fetching) on nonsensical input
+    if (isGibberish(userMessage)) {
+      console.log('[AI Service] 🚫 Detected gibberish input, returning fast response without API call');
+      return {
+        message: "I'm not sure I understand what you're trying to say. Could you please rephrase your question? I can help you with:\n\n• Finding incidents or tickets\n• Searching for users\n• Creating new tickets\n• Getting information about Ivanti\n\nHow can I assist you?",
+        actions: []
+      };
+    }
+
+    // 2025 INDUSTRY BEST PRACTICE: Out-of-scope detection
+    // Detect queries unrelated to Ivanti Service Manager before expensive processing
+    // This saves resources and provides fast, helpful responses
+    // Pass conversation history for context-aware detection (follow-ups may be in-scope)
+    if (isOutOfScope(userMessage, conversationHistory)) {
+      console.log('[AI Service] 🚫 Detected out-of-scope query, returning helpful redirect without API call');
+      return {
+        message: "I'm specialized in helping with Ivanti Service Manager tasks. I can assist you with:\n\n✅ **Finding and viewing tickets** - \"Show my tickets\", \"Find incident #12345\"\n✅ **Searching for users** - \"Find user John Doe\", \"Who is jane@company.com\"\n✅ **Creating tickets** - \"Create a ticket for...\", \"I need help with...\"\n✅ **Updating tickets** - \"Update incident #12345\", \"Change status to...\"\n✅ **Ivanti information** - Questions about how Ivanti works, categories, services, etc.\n\nFor general questions or other topics, I'd recommend using a general-purpose assistant. How can I help you with Ivanti today?",
+        actions: []
+      };
+    }
+
     // Lightweight "understanding" layer: normalize very common vague patterns
     const interpretationNotes: string[] = [];
     let normalizedMessage = userMessage;
+
+    // TYPO CORRECTION: Fix common typos before processing to prevent AI overload
+    // This uses fuzzy matching (Levenshtein distance) with domain-specific dictionary
+    // Always runs (it's fast) but only corrects when confident (similarity >= 0.75)
+    // Skip typo correction for very short inputs or obvious gibberish (performance optimization)
+    if (userMessage.length >= 3 && !isGibberish(userMessage)) {
+      const typoResult = correctTypos(userMessage);
+      if (typoResult.wasCorrected && typoResult.corrections.length > 0) {
+        normalizedMessage = typoResult.correctedMessage;
+        console.log('[AI Service] ✅ Typo corrections applied:', typoResult.corrections.map(c => `${c.original} → ${c.corrected} (${Math.round(c.confidence * 100)}% confidence)`).join(', '));
+        
+        // Add note about corrections for AI context (helps AI understand user intent better)
+        const correctionSummary = typoResult.corrections.map(c => `"${c.original}" was corrected to "${c.corrected}"`).join(', ');
+        interpretationNotes.push(`USER INPUT CORRECTION: ${correctionSummary}. The user may have made typos, but the corrected terms should be used for understanding their intent.`);
+      }
+    }
 
     // Normalize some extremely common vague phrasings into clearer intent
     if (/what incidents in december 1/i.test(userMessage) || /incidents.*december 1/i.test(userMessage)) {
@@ -199,20 +568,29 @@ export async function processMessage(
 
     // SECURITY: Early check for forbidden operations - block before any processing
     const lowerMessage = normalizedMessage.toLowerCase();
+    const capabilities = currentUser.capabilities;
     
-    // Block password-related operations - ABSOLUTELY FORBIDDEN
-    if (lowerMessage.includes('password') || lowerMessage.includes('change password') || 
-        lowerMessage.includes('reset password') || lowerMessage.includes('set password') ||
-        lowerMessage.includes('update password') || lowerMessage.includes('new password') ||
-        lowerMessage.includes('forgot password') || lowerMessage.includes('show password') ||
-        lowerMessage.includes('tell password') || lowerMessage.includes('reveal password') ||
-        lowerMessage.includes('what is my password') || lowerMessage.includes('what\'s my password')) {
-      console.warn('[AI Service] 🚨 SECURITY: User attempted password operation - BLOCKED');
+    // INTELLIGENT PASSWORD HANDLING: Distinguish between dangerous operations and helpful guidance
+    // Block dangerous password operations - ABSOLUTELY FORBIDDEN
+    const dangerousPasswordOps = [
+      'show password', 'tell password', 'reveal password', 'display password',
+      'what is my password', 'what\'s my password', 'give me password',
+      'change password for', 'reset password for', 'set password for', 'update password for',
+      'modify password for', 'new password for', 'create password for'
+    ];
+    
+    const isDangerousPasswordOp = dangerousPasswordOps.some(op => lowerMessage.includes(op));
+    
+    if (isDangerousPasswordOp) {
+      console.warn('[AI Service] 🚨 SECURITY: User attempted dangerous password operation - BLOCKED');
       return {
-        message: 'I cannot help with password changes or reveal passwords. This is a security restriction. Please contact your system administrator or use the official password reset process in your system.',
+        message: 'I cannot reveal passwords, change passwords for other users, or perform any password-related actions. This is a security restriction. If you need to reset your own password, please ask me "how do I reset my password?" or "I forgot my password, what should I do?"',
         actions: []
       };
     }
+    
+    // Note: Helpful password guidance (how to reset, forgot password help, etc.)
+    // will be handled by the AI with documentation support below - no blocking needed
     
     // Block deletion operations - ABSOLUTELY FORBIDDEN
     if (lowerMessage.includes('delete') || lowerMessage.includes('remove') || 
@@ -226,6 +604,76 @@ export async function processMessage(
           message: 'I cannot delete any incidents, tickets, records, or user accounts. This is a security restriction to prevent accidental data loss. If you need something removed, please contact your system administrator.',
           actions: []
         };
+      }
+    }
+    
+    // SECURITY: Role-based query filtering
+    // Self Service users can ONLY create tickets and view their own tickets
+    if (capabilities) {
+      // Check if user is trying to search for employees/users (requires canViewAllUsers)
+      const isSearchingUsers = 
+        lowerMessage.includes('search') && (lowerMessage.includes('user') || lowerMessage.includes('employee') || lowerMessage.includes('person')) ||
+        lowerMessage.includes('find') && (lowerMessage.includes('user') || lowerMessage.includes('employee') || lowerMessage.includes('person')) ||
+        lowerMessage.includes('who is') || lowerMessage.includes('tell me about') ||
+        lowerMessage.includes('get details about') || lowerMessage.includes('details about') ||
+        /^[A-Z][a-z]+ [A-Z][a-z]+/.test(userMessage.trim()); // Pattern like "John Doe" (likely searching for a person)
+      
+      if (isSearchingUsers && !capabilities.canViewAllUsers) {
+        console.warn('[AI Service] 🚨 SECURITY: Self Service user attempted to search employees - BLOCKED');
+        return {
+          message: 'I cannot search for other users or employees. As a Self Service user, you can only:\n\n✅ Create new tickets\n✅ View your own tickets\n\nIf you need to contact someone, please use the official Ivanti interface or contact your IT support team.',
+          actions: []
+        };
+      }
+      
+      // Check if user is trying to view all tickets (requires canViewAllTickets)
+      const isViewingAllTickets = 
+        (lowerMessage.includes('all tickets') || lowerMessage.includes('all incidents')) &&
+        !lowerMessage.includes('my tickets') && !lowerMessage.includes('my incidents');
+      
+      if (isViewingAllTickets && !capabilities.canViewAllTickets) {
+        console.warn('[AI Service] 🚨 SECURITY: Self Service user attempted to view all tickets - BLOCKED');
+        return {
+          message: 'I can only show you your own tickets. As a Self Service user, you can:\n\n✅ Create new tickets\n✅ View your own tickets\n\nTo see all tickets, you need elevated permissions. Please contact your IT administrator if you believe you need this access.',
+          actions: []
+        };
+      }
+      
+      // Check if user is trying to view other users' tickets
+      const isViewingOtherTickets = 
+        (lowerMessage.includes('ticket') || lowerMessage.includes('incident')) &&
+        (lowerMessage.includes('of') || lowerMessage.includes('for')) &&
+        !lowerMessage.includes('my') && !lowerMessage.includes('i created');
+      
+      if (isViewingOtherTickets && !capabilities.canViewAllTickets) {
+        // Check if they mentioned a name (likely asking for someone else's tickets)
+        const namePattern = /(?:ticket|incident).*(?:of|for|by)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)/i;
+        if (namePattern.test(userMessage)) {
+          console.warn('[AI Service] 🚨 SECURITY: Self Service user attempted to view other user\'s tickets - BLOCKED');
+          return {
+            message: 'I can only show you your own tickets. As a Self Service user, you cannot view tickets created by other users.\n\nYou can:\n✅ Create new tickets\n✅ View your own tickets\n\nIf you need information about a specific ticket, please contact your IT support team.',
+            actions: []
+          };
+        }
+      }
+      
+      // Check if user is trying to edit/update tickets (requires canEditAllTickets)
+      const isEditingTickets = 
+        lowerMessage.includes('update') || lowerMessage.includes('edit') || 
+        lowerMessage.includes('change') || lowerMessage.includes('modify') ||
+        lowerMessage.includes('assign') || lowerMessage.includes('close') ||
+        lowerMessage.includes('resolve');
+      
+      if (isEditingTickets && !capabilities.canEditAllTickets && !capabilities.canCloseTickets) {
+        // Allow if they're asking about their own tickets
+        const isOwnTicket = lowerMessage.includes('my ticket') || lowerMessage.includes('my incident');
+        if (!isOwnTicket) {
+          console.warn('[AI Service] 🚨 SECURITY: Self Service user attempted to edit tickets - BLOCKED');
+          return {
+            message: 'I cannot update or edit tickets. As a Self Service user, you can only:\n\n✅ Create new tickets\n✅ View your own tickets\n\nTo update tickets, please use the official Ivanti interface or contact your IT support team.',
+            actions: []
+          };
+        }
       }
     }
 
@@ -263,33 +711,68 @@ export async function processMessage(
       needsIvantiData = true;
     }
 
-    // Limit conversation history to prevent token overflow
-    // Keep last 20 messages (10 user + 10 assistant) plus any system messages
-    const MAX_HISTORY_MESSAGES = 20;
-    if (conversationHistory.length > MAX_HISTORY_MESSAGES) {
-      // Keep system messages and recent messages
-      const systemMessages = conversationHistory.filter(msg => msg.role === 'system');
-      const recentMessages = conversationHistory.filter(msg => msg.role !== 'system').slice(-MAX_HISTORY_MESSAGES);
+    // 2025 BEST PRACTICE: Intelligent conversation management
+    // Handles long conversations, messy contexts, and prevents AI overload
+    const conversationManagement = manageConversation(conversationHistory, normalizedMessage);
+    
+    if (conversationManagement.wasReset) {
+      console.warn('[AI Service] 🔄 Conversation was reset due to complexity:', conversationManagement.warnings);
       conversationHistory.length = 0;
-      conversationHistory.push(...systemMessages, ...recentMessages);
-      console.log('[AI Service] Trimmed conversation history to', conversationHistory.length, 'messages');
+      conversationHistory.push(...conversationManagement.managedMessages);
+      
+      // Add a user-friendly note about the reset
+      interpretationNotes.push('CONVERSATION RESET: The conversation was reset to start fresh due to length/complexity. Please continue with your question.');
+    } else if (conversationManagement.wasSummarized) {
+      console.log('[AI Service] 📝 Conversation was summarized for better context management');
+      conversationHistory.length = 0;
+      conversationHistory.push(...conversationManagement.managedMessages);
+      
+      // Extract key info for context
+      const keyInfo = extractConversationKeyInfo(conversationHistory);
+      if (keyInfo.mentionedIncidents.length > 0) {
+        interpretationNotes.push(`Recent context: User has been discussing incidents ${keyInfo.mentionedIncidents.join(', ')}`);
+      }
+    } else if (conversationManagement.managedMessages.length !== conversationHistory.length) {
+      // Conversation was cleaned but not summarized
+      console.log('[AI Service] 🧹 Conversation was cleaned (removed redundant messages)');
+      conversationHistory.length = 0;
+      conversationHistory.push(...conversationManagement.managedMessages);
+    }
+    
+    // Log warnings if any
+    if (conversationManagement.warnings.length > 0) {
+      console.warn('[AI Service] Conversation management warnings:', conversationManagement.warnings);
     }
 
     // Fetch Ivanti data FIRST if needed, and add it to history BEFORE processing
+    // PERFORMANCE OPTIMIZATION: Skip data fetching for gibberish or out-of-scope queries
+    // (even if patterns matched - prevents unnecessary API calls)
+    // Pass conversation history for context-aware scope detection
     let ivantiContext = '';
     let actualDataFetched = false;
-    if (needsIvantiData) {
+    if (needsIvantiData && !isGibberish(normalizedMessage) && !isOutOfScope(normalizedMessage, conversationHistory)) {
       console.log('[AI Service] User query requires Ivanti data, fetching...');
       ivantiContext = await fetchIvantiData(normalizedMessage, currentUser, conversationHistory);
-      console.log('[AI Service] Ivanti data fetched:', ivantiContext.substring(0, 200));
+      console.log('[AI Service] Ivanti data fetched (first 500 chars):', ivantiContext.substring(0, 500));
       
       // Check if we actually got real data (not just error messages)
       actualDataFetched = !!ivantiContext && 
         !ivantiContext.includes('I\'d be happy to help') && 
         !ivantiContext.includes('Sorry, I encountered an error') &&
         !ivantiContext.includes('NO USER FOUND') &&
-        !ivantiContext.includes('NO DATA FOUND');
-
+        !ivantiContext.includes('NO DATA FOUND') &&
+        !ivantiContext.includes('RESULT: No incidents found');
+      
+      // Log what incidents are actually in the fetched data
+      if (actualDataFetched) {
+        const incidentMatches = ivantiContext.match(/Incident[#\s]+(\d{4,})/gi);
+        const incidentCount = incidentMatches ? incidentMatches.length : 0;
+        const incidentNumbers = incidentMatches ? incidentMatches.map(m => m.match(/\d{4,}/)?.[0]).filter(Boolean) : [];
+        console.log(`[AI Service] ✅ Data fetched successfully. Found ${incidentCount} incidents:`, incidentNumbers);
+      } else {
+        console.warn('[AI Service] ⚠️ No valid data fetched. AI should NOT list any incidents.');
+      }
+      
       if (actualDataFetched) {
         for (let i = conversationHistory.length - 1; i >= 0; i--) {
           const msg = conversationHistory[i];
@@ -315,12 +798,27 @@ export async function processMessage(
       if (!actualDataFetched) {
         conversationHistory.push({
           role: 'system',
-          content: `[WARNING]: No data was found in Ivanti. DO NOT make up any RecIds, emails, or other details. Tell the user the search didn't return results.`
+          content: `[CRITICAL WARNING]: No data was found in Ivanti. DO NOT make up any RecIds, emails, incident numbers, or other details. DO NOT list incidents. DO NOT say "you have X incidents". Tell the user the search didn't return results or that you couldn't retrieve the data.`
         });
       } else {
+        // Extract incident numbers from fetched data for validation
+        const fetchedIncidentNumbers = [...ivantiContext.matchAll(/Incident[#\s]+(\d{4,})/gi)].map(m => m[1]);
+        const incidentList = fetchedIncidentNumbers.length > 0 
+          ? `The fetched data contains these incident numbers: ${fetchedIncidentNumbers.join(', ')}. ONLY list these incidents.`
+          : 'No specific incidents found in fetched data.';
+        
         conversationHistory.push({
           role: 'system',
-          content: `[RESPONSE RULE]: You already have the Ivanti results above. Respond with those details now using plain text paragraphs. Do NOT say that you are still searching.`
+          content: `[CRITICAL RESPONSE RULE]: You already have the Ivanti results above. ${incidentList}
+
+STRICT RULES:
+1. ONLY use data from the [DATA FETCHED FROM IVANTI] block above
+2. DO NOT use knowledge base data for listing incidents - it may be outdated
+3. DO NOT make up incident numbers, RecIds, or any other details
+4. DO NOT list incidents that are not in the fetched data above
+5. If the fetched data shows X incidents, list ONLY those X incidents - no more, no less
+6. Do NOT say "you have X incidents" unless you can count exactly X incidents in the fetched data above
+7. Respond with those details now using plain text paragraphs. Do NOT say that you are still searching.`
         });
       }
     }
@@ -335,7 +833,23 @@ export async function processMessage(
     }
 
     // Build system instruction (static, doesn't change per message)
-    const systemInstruction = await buildSystemPrompt(currentUser, ticketId, kbContext);
+    // Check if this is a password guidance request - if so, load documentation
+    const isPasswordGuidanceRequest = 
+      (lowerMessage.includes('password') || lowerMessage.includes('forgot') || lowerMessage.includes('lockout')) &&
+      (lowerMessage.includes('how') || lowerMessage.includes('help') || lowerMessage.includes('what') ||
+       lowerMessage.includes('guide') || lowerMessage.includes('steps') || lowerMessage.includes('process') ||
+       lowerMessage.includes('can\'t login') || lowerMessage.includes('cannot login') ||
+       lowerMessage.includes('locked out') || lowerMessage.includes('locked'));
+    
+    // Load relevant documentation if this is a password guidance request
+    let documentationContext = '';
+    if (isPasswordGuidanceRequest) {
+      const relevantDocs = getRelevantDocumentation(normalizedMessage);
+      documentationContext = formatDocumentationForContext(relevantDocs);
+      console.log('[AI Service] 📚 Loaded documentation for password guidance:', relevantDocs.length, 'sections');
+    }
+    
+    const systemInstruction = await buildSystemPrompt(currentUser, ticketId, kbContext + documentationContext);
 
     // Convert conversation history to Gemini format
     // IMPORTANT: Include ALL messages in order (user, assistant, system)
@@ -372,76 +886,273 @@ export async function processMessage(
     
     // Add current user message to conversation history (for next time)
     // This ensures the history is complete for the next message
+    // 2025 BEST PRACTICE: Include timestamp for better context tracking
     conversationHistory.push({
       role: 'user',
-      content: userMessage
+      content: userMessage,
+      timestamp: Date.now()
     });
+    
+    // 2025 BEST PRACTICE: Add explicit conversation state to system prompt
+    // This helps the AI maintain awareness of the ongoing conversation
+    const conversationState = buildConversationState(conversationHistory, userMessage);
+    let enhancedSystemInstruction = systemInstruction;
+    if (conversationState && enhancedSystemInstruction) {
+      enhancedSystemInstruction = `${enhancedSystemInstruction}\n\n${conversationState}`;
+    }
     
     console.log('[AI Service] Conversation history length:', conversationHistory.length);
     console.log('[AI Service] Contents array length:', contents.length);
     console.log('[AI Service] Last few messages:', conversationHistory.slice(-3).map(m => `${m.role}: ${m.content.substring(0, 50)}...`));
 
-    // Build Gemini API request
-    // Note: systemInstruction should be at the root level, not nested
     // Best practice: use LOWER temperature for grounded / data-backed queries to reduce hallucinations
     const effectiveTemperature =
       needsIvantiData ? Math.min(AI_CONFIG.temperature, 0.3) : AI_CONFIG.temperature;
 
-    const requestBody: any = {
-      contents: contents,
-      generationConfig: {
-        temperature: effectiveTemperature,
-        maxOutputTokens: AI_CONFIG.maxOutputTokens,
-        topP: 0.9,
-        topK: needsIvantiData ? 20 : 40, // slightly narrower sampling when grounded
+    const selectedModel = model || AI_CONFIG.model;
+    
+    // Get provider from storage (runtime config) or fall back to build-time config
+    let provider: 'gemini' | 'ollama' = AI_CONFIG.provider;
+    try {
+      const storageResult = await chrome.storage.local.get(['aiProvider']);
+      if (storageResult.aiProvider) {
+        provider = (storageResult.aiProvider.toLowerCase() as 'gemini' | 'ollama') || AI_CONFIG.provider;
       }
+    } catch (error) {
+      console.warn('[AI Service] Could not read provider from storage, using config default:', error);
+    }
+    
+    // Also check if the selected model indicates the provider
+    const ollamaModels = ['llama3.2', 'llama3.1', 'llama3', 'mistral', 'qwen2.5', 'phi3'];
+    if (ollamaModels.includes(selectedModel)) {
+      provider = 'ollama';
+    } else if (selectedModel.startsWith('gemini-')) {
+      provider = 'gemini';
+    }
+    
+    let apiUrl: string;
+    let requestBody: any;
+    let headers: Record<string, string> = {
+      'Content-Type': 'application/json'
     };
 
-    // Add system instruction (some models support it at root level)
-    if (systemInstruction) {
-      requestBody.systemInstruction = {
-        parts: [{ text: systemInstruction }]
-      };
-    }
-
-    // Call Gemini API
-    const apiUrl = `${AI_CONFIG.apiUrl}/models/${AI_CONFIG.model}:generateContent?key=${AI_CONFIG.apiKey}`;
-    
-    console.log('[AI Service] Calling Gemini API:', apiUrl.replace(AI_CONFIG.apiKey, '***'));
-    console.log('[AI Service] Request body:', JSON.stringify(requestBody, null, 2).substring(0, 500));
-
-    const response = await fetch(apiUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(requestBody)
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      let errorData;
-      try {
-        errorData = JSON.parse(errorText);
-      } catch {
-        errorData = { error: { message: errorText || response.statusText } };
-      }
-      console.error('[AI Service] Gemini API error:', errorData);
-      console.error('[AI Service] Status:', response.status);
-      console.error('[AI Service] Full error:', errorText);
+    if (provider === 'ollama') {
+      // Ollama API format
+      // Convert conversation history to Ollama messages format
+      const ollamaMessages: Array<{ role: string; content: string }> = [];
       
-      const errorMessage = errorData.error?.message || errorData.message || response.statusText;
-      throw new Error(`Gemini API error (${response.status}): ${errorMessage}`);
+      // Add system instruction as first message
+      if (enhancedSystemInstruction) {
+        ollamaMessages.push({
+          role: 'system',
+          content: enhancedSystemInstruction
+        });
+      }
+      
+      // Convert conversation history to Ollama format
+      for (const msg of conversationHistory) {
+        if (msg.role === 'assistant') {
+          ollamaMessages.push({ role: 'assistant', content: msg.content });
+        } else if (msg.role === 'user') {
+          ollamaMessages.push({ role: 'user', content: msg.content });
+        } else if (msg.role === 'system') {
+          // System messages can be added as user messages with context
+          ollamaMessages.push({ role: 'user', content: msg.content });
+        }
+      }
+      
+      // Add current user message
+      ollamaMessages.push({ role: 'user', content: userMessage });
+      
+      apiUrl = `${AI_CONFIG.ollamaUrl}/api/chat`;
+      requestBody = {
+        model: selectedModel,
+        messages: ollamaMessages,
+        stream: false,
+        options: {
+          temperature: effectiveTemperature,
+          num_predict: AI_CONFIG.maxOutputTokens,
+        }
+      };
+      console.log('[AI Service] Calling Ollama API with model:', selectedModel, 'at', apiUrl);
+      console.log('[AI Service] Request body (first 500 chars):', JSON.stringify(requestBody, null, 2).substring(0, 500));
+    } else {
+      // Gemini API format
+      requestBody = {
+        contents: contents,
+        generationConfig: {
+          temperature: effectiveTemperature,
+          maxOutputTokens: AI_CONFIG.maxOutputTokens,
+          topP: 0.9,
+          topK: needsIvantiData ? 20 : 40, // slightly narrower sampling when grounded
+        }
+      };
+
+      // Add system instruction (some models support it at root level)
+      if (enhancedSystemInstruction) {
+        requestBody.systemInstruction = {
+          parts: [{ text: enhancedSystemInstruction }]
+        };
+      }
+
+      // Validate API key before making the call
+      if (!AI_CONFIG.geminiApiKey || AI_CONFIG.geminiApiKey.trim() === '') {
+        console.error('[AI Service] ❌ Gemini API key is missing!');
+        throw new Error('Gemini API key is not configured. Please set VITE_GEMINI_API_KEY in a .env.local file. Get your API key from: https://ai.google.dev/');
+      }
+
+      apiUrl = `${AI_CONFIG.geminiApiUrl}/models/${selectedModel}:generateContent?key=${AI_CONFIG.geminiApiKey}`;
+      
+      console.log('[AI Service] Calling Gemini API with model:', selectedModel, apiUrl.replace(AI_CONFIG.geminiApiKey, '***'));
+      console.log('[AI Service] Request body (first 500 chars):', JSON.stringify(requestBody, null, 2).substring(0, 500));
     }
 
-    const data = await response.json();
+    // Retry logic for rate limiting (429 errors) and network issues
+    let lastError: any = null;
+    let data: any = null;
+    const maxRetries = provider === 'ollama' ? 2 : 3; // Ollama is local, fewer retries needed
+    let retryDelay = 1000; // Start with 1 second
     
-    // Log full response for debugging
-    console.log('[AI Service] Gemini API response:', JSON.stringify(data, null, 2).substring(0, 1000));
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const response = await fetch(apiUrl, {
+          method: 'POST',
+          headers: headers,
+          body: JSON.stringify(requestBody)
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          let errorData;
+          try {
+            errorData = JSON.parse(errorText);
+          } catch {
+            errorData = { error: { message: errorText || response.statusText } };
+          }
+          
+          // Handle 429 (Quota/Rate Limit) errors with retry (Gemini only)
+          if (provider === 'gemini' && response.status === 429) {
+            const errorMessage = errorData.error?.message || errorData.message || response.statusText;
+            
+            // Extract retry delay from error if available
+            const retryMatch = errorMessage.match(/retry in ([\d.]+)s/i);
+            if (retryMatch) {
+              retryDelay = parseFloat(retryMatch[1]) * 1000; // Convert to milliseconds
+            }
+            
+            // Check if it's a quota exhaustion (not just rate limit)
+            const isQuotaExhausted = errorMessage.includes('quota') || 
+                                    errorMessage.includes('Quota exceeded') ||
+                                    errorMessage.includes('RESOURCE_EXHAUSTED') ||
+                                    errorData.error?.status === 'RESOURCE_EXHAUSTED';
+            
+            // BEST PRACTICE: Fail fast on quota exhaustion - retrying won't help
+            // Quota exhaustion means you've hit your daily limit, waiting won't fix it
+            if (isQuotaExhausted) {
+              console.error(`[AI Service] ❌ Quota exhausted - failing fast (no retry)`);
+              throw new Error(`QUOTA_EXHAUSTED: ${errorMessage}\n\n💡 Tip: The free tier has a daily limit. Try:\n- Switching to gemini-2.5-flash model (higher quota)\n- Waiting until tomorrow\n- Upgrading your Google AI Studio plan\n- Or switch to Ollama by setting VITE_AI_PROVIDER=ollama`);
+            } else {
+              // Rate limit (temporary) - retry with delay, but cap at 10 seconds max
+              if (attempt < maxRetries) {
+                // Cap retry delay at 10 seconds to prevent long waits
+                const cappedDelay = Math.min(retryDelay, 10000);
+                console.warn(`[AI Service] ⚠️ Rate limited, retrying in ${cappedDelay/1000}s (attempt ${attempt + 1}/${maxRetries + 1})...`);
+                await new Promise(resolve => setTimeout(resolve, cappedDelay));
+                retryDelay = Math.min(retryDelay * 2, 10000); // Exponential backoff, capped at 10s
+                continue;
+              }
+            }
+          }
+          
+          // For other errors, log and throw
+          const providerName = provider === 'ollama' ? 'Ollama' : 'Gemini';
+          console.error(`[AI Service] ${providerName} API error:`, errorData);
+          console.error('[AI Service] Status:', response.status);
+          console.error('[AI Service] Full error:', errorText);
+          
+          const errorMessage = errorData.error?.message || errorData.message || response.statusText;
+          throw new Error(`${providerName} API error (${response.status}): ${errorMessage}`);
+        }
+        
+        // Success! Parse response
+        lastError = null;
+        data = await response.json();
+        
+        // Log full response for debugging
+        console.log(`[AI Service] ${provider === 'ollama' ? 'Ollama' : 'Gemini'} API response:`, JSON.stringify(data, null, 2).substring(0, 1000));
+        
+        break; // Exit retry loop on success
+        
+      } catch (error: any) {
+        lastError = error;
+        
+        // If it's a quota error, don't retry
+        if (error.message?.includes('QUOTA_EXHAUSTED')) {
+          throw error;
+        }
+        
+        // If it's a network error and we're using Ollama, provide helpful message
+        if (provider === 'ollama' && (error.message?.includes('fetch') || error.message?.includes('network'))) {
+          if (attempt === maxRetries) {
+            throw new Error(`Cannot connect to Ollama at ${AI_CONFIG.ollamaUrl}. Make sure Ollama is running and accessible. Check:\n1. Is Ollama running? (ollama serve)\n2. Is the URL correct? (current: ${AI_CONFIG.ollamaUrl})\n3. Can you access it in your browser?`);
+          }
+        }
+        
+        // If it's the last attempt, throw the error
+        if (attempt === maxRetries) {
+          throw error;
+        }
+        
+        // Otherwise, wait and retry
+        console.warn(`[AI Service] ⚠️ Request failed, retrying in ${retryDelay/1000}s (attempt ${attempt + 1}/${maxRetries + 1})...`);
+        await new Promise(resolve => setTimeout(resolve, retryDelay));
+        retryDelay *= 2;
+      }
+    }
     
-    // Extract response text from Gemini format
-    let aiMessage = data.candidates?.[0]?.content?.parts?.[0]?.text || 
+    // If we exited the loop with an error, throw it
+    if (lastError) {
+      throw lastError;
+    }
+    
+    // If we don't have data, something went wrong
+    if (!data) {
+      const providerName = provider === 'ollama' ? 'Ollama' : 'Gemini';
+      throw new Error(`Failed to get response from ${providerName} API after retries`);
+    }
+    
+    // Extract response text based on provider
+    let aiMessage: string;
+    if (provider === 'ollama') {
+      // Ollama response format: { message: { role, content }, done: true }
+      aiMessage = data.message?.content || data.response || 'Sorry, I could not generate a response.';
+    } else {
+      // Gemini response format: { candidates: [{ content: { parts: [{ text }] } }] }
+      aiMessage = data.candidates?.[0]?.content?.parts?.[0]?.text || 
                     'Sorry, I could not generate a response.';
+    }
+
+    // Log the raw AI response to verify markdown formatting
+    console.log('[AI Service] 📝 Raw AI response (first 500 chars):', aiMessage.substring(0, 500));
+    
+    // Detect markdown formatting in response
+    const hasMarkdownTable = /^\s*\|.*\|/m.test(aiMessage) || /\n\s*\|.*\|.*\n\s*\|[-:]+\|/m.test(aiMessage);
+    const hasMarkdownList = /^[\s]*[-*+]\s/m.test(aiMessage) || /^\d+\.\s/m.test(aiMessage);
+    const hasBoldText = /\*\*[^*]+\*\*/.test(aiMessage);
+    const hasIncidentData = /incident\s*#?\s*\d+/i.test(aiMessage);
+    
+    console.log('[AI Service] 📝 Markdown Detection:', {
+      hasTable: hasMarkdownTable,
+      hasList: hasMarkdownList,
+      hasBold: hasBoldText,
+      hasIncidentData: hasIncidentData,
+      responseLength: aiMessage.length
+    });
+    
+    // If we have incident data but no proper markdown formatting, log a warning
+    if (hasIncidentData && !hasMarkdownTable && !hasMarkdownList) {
+      console.warn('[AI Service] ⚠️ Incident data detected but no markdown formatting found! AI may not be following formatting instructions.');
+    }
 
     // Check for blocked content or errors in response
     if (data.candidates?.[0]?.finishReason === 'SAFETY') {
@@ -458,13 +1169,107 @@ export async function processMessage(
 
     console.log('[AI Service] ✅ Generated response from Gemini');
 
+    // ⚠️ CRITICAL VALIDATION: If user asked for data but none was fetched, block any data listing
+    if (needsIvantiData && !actualDataFetched) {
+      // Check if AI is claiming to have data when none was fetched
+      const claimsToHaveData = 
+        aiMessage.match(/you have \d+ incidents?/i) ||
+        aiMessage.match(/I found \d+ incidents?/i) ||
+        aiMessage.match(/there are \d+ incidents?/i) ||
+        aiMessage.match(/Incident #\d+/i) ||
+        aiMessage.match(/here are (the|your) incidents?/i);
+      
+      if (claimsToHaveData) {
+        console.error('[AI Service] 🚨 BLOCKING: AI claims to have data when none was fetched');
+        aiMessage = "I couldn't retrieve the incident data from Ivanti at this time. Please try again in a moment, or check the system directly. If the problem persists, there may be an issue with the Ivanti connection.";
+      }
+    }
+
     // ⚠️ HALLUCINATION DETECTION - Validate AI response against fetched data
+    // CRITICAL: Block responses that contain made-up data
     if (needsIvantiData && actualDataFetched) {
       const hallucinationWarnings = detectHallucinations(aiMessage, ivantiContext);
       if (hallucinationWarnings.length > 0) {
         console.error('[AI Service] 🚨 HALLUCINATION DETECTED:', hallucinationWarnings);
-        // Log for debugging but don't block the response
-        // In production, you might want to regenerate or modify the response
+        
+        // CRITICAL: If AI is making up incident numbers, block the response
+        const incidentPattern = /Incident[#\s]+(\d{4,})/gi;
+        const mentionedIncidents = [...aiMessage.matchAll(incidentPattern)].map(m => m[1]);
+        const hasMadeUpIncidents = mentionedIncidents.some(incNum => !ivantiContext.includes(incNum));
+        
+        if (hasMadeUpIncidents) {
+          console.error('[AI Service] 🚨 BLOCKING RESPONSE: AI made up incident numbers that are not in fetched data');
+          // Regenerate a safe response that only uses actual data
+          const safeResponse = generateSafeResponseFromData(ivantiContext, userMessage);
+          if (safeResponse) {
+            aiMessage = safeResponse;
+          } else {
+            // If we can't generate a safe response, tell user we couldn't find data
+            aiMessage = "I apologize, but I couldn't retrieve the incident data from Ivanti. Please try again or check the system directly.";
+          }
+        }
+      }
+      
+      // ADDITIONAL VALIDATION: If AI lists specific incidents, verify they're all in the fetched data
+      if (aiMessage.includes('Incident #') || aiMessage.includes('incident #')) {
+        const allIncidentNumbers = [...aiMessage.matchAll(/Incident[#\s]+(\d{4,})/gi)].map(m => m[1]);
+        const missingIncidents = allIncidentNumbers.filter(incNum => !ivantiContext.includes(incNum));
+        
+        if (missingIncidents.length > 0) {
+          console.error('[AI Service] 🚨 BLOCKING: AI listed incidents not in fetched data:', missingIncidents);
+          console.error('[AI Service] Fetched data contains these incidents:', [...ivantiContext.matchAll(/Incident[#\s]+(\d{4,})/gi)].map(m => m[1]));
+          
+          // Remove made-up incidents from response
+          for (const incNum of missingIncidents) {
+            // Remove the entire incident entry (from "Incident #X" to next "Incident #" or end of section)
+            // Handle both markdown and plain text formats
+            const patterns = [
+              new RegExp(`\\*\\*Incident[#\\s]*${incNum}\\*\\*[\\s\\S]*?(?=\\*\\*Incident|$)`, 'gi'),
+              new RegExp(`Incident[#\\s]*${incNum}[\\s\\S]*?(?=Incident[#\\s]*\\d|$)`, 'gi'),
+            ];
+            
+            for (const pattern of patterns) {
+              aiMessage = aiMessage.replace(pattern, '');
+            }
+          }
+          
+          // Clean up any double newlines or empty sections
+          aiMessage = aiMessage.replace(/\n{3,}/g, '\n\n').trim();
+          
+          // If we removed all incidents, regenerate from actual data
+          if (aiMessage.length < 100 || !aiMessage.match(/Incident[#\s]+(\d{4,})/i)) {
+            const safeResponse = generateSafeResponseFromData(ivantiContext, userMessage);
+            if (safeResponse) {
+              aiMessage = safeResponse;
+            } else {
+              aiMessage = "I found some incidents, but I need to verify the data. Please try asking again in a moment.";
+            }
+          } else {
+            // Add warning if we removed some incidents
+            aiMessage = `I found these incidents in the system:\n\n${aiMessage}\n\n(Note: Some incidents may not be available at this time)`;
+          }
+        }
+      }
+      
+      // VALIDATION: Ensure AI doesn't claim a count that doesn't match fetched data
+      const countMatch = aiMessage.match(/(?:you have|I found|there are|showing|listing)\s+(\d+)\s+incidents?/i);
+      if (countMatch) {
+        const claimedCount = parseInt(countMatch[1], 10);
+        // Count actual incidents in the fetched data
+        const actualIncidentMatches = ivantiContext.match(/Incident[#\s]+(\d{4,})/gi);
+        const actualCount = actualIncidentMatches ? actualIncidentMatches.length : 0;
+        
+        if (claimedCount !== actualCount && actualCount > 0) {
+          console.error(`[AI Service] 🚨 CORRECTING: AI claimed ${claimedCount} incidents but data has ${actualCount}`);
+          // Replace the incorrect count with the correct one
+          aiMessage = aiMessage.replace(
+            new RegExp(`(?:you have|I found|there are|showing|listing)\\s+${claimedCount}\\s+incidents?`, 'i'),
+            `I found ${actualCount} incident${actualCount !== 1 ? 's' : ''}`
+          );
+        } else if (claimedCount > 0 && actualCount === 0) {
+          console.error('[AI Service] 🚨 BLOCKING: AI claimed incidents but none in fetched data');
+          aiMessage = "I couldn't retrieve your incidents from Ivanti at this time. Please try again in a moment or check the system directly.";
+        }
       }
 
       // RESPONSE-LAYER GUARD: if the model incorrectly claims there is no data
@@ -716,7 +1521,7 @@ export async function processMessage(
     if (false && deleteIncidentMatch) {
       try {
         console.log('[AI Service] Found DELETE_INCIDENT marker, parsing...');
-        const deleteDataJson = deleteIncidentMatch[1];
+        const deleteDataJson = deleteIncidentMatch?.[1] || '';
         const deleteData = JSON.parse(deleteDataJson);
         
         console.log('[AI Service] Parsed delete data:', deleteData);
@@ -814,7 +1619,12 @@ async function buildSystemPrompt(currentUser: IvantiUser, ticketId: string | nul
   // Format knowledge base context if provided
   let formattedKbContext = '';
   if (kbContext && !kbContext.includes('not available')) {
-    formattedKbContext = `\n\nKNOWLEDGE BASE (Pre-loaded Ivanti Data):\n${kbContext}\n\nIMPORTANT: You have access to a comprehensive knowledge base of Ivanti data that was pre-loaded. Use this data to answer questions about employees, incidents, services, categories, teams, and departments. When users ask about any of these, check the knowledge base first. This is real data from Ivanti that is stored locally for fast access. If a user asks for "one with detail" or "give me one", provide the FULL details from the knowledge base.`;
+    formattedKbContext = `\n\nKNOWLEDGE BASE AND DOCUMENTATION:\n${kbContext}\n\nIMPORTANT: 
+- The [IVANTI DOCUMENTATION] sections contain OFFICIAL Ivanti documentation - use this for how Ivanti works, terminology, and processes
+- The [KNOWLEDGE BASE] sections contain actual data from this organization's Ivanti instance - use this for specific records (incidents, employees, services, etc.)
+- When users ask "how does X work in Ivanti" or "what is Y", reference the documentation
+- When users ask "show me incidents" or "find employee X", use the knowledge base data
+- If a user asks for "one with detail" or "give me one", provide the FULL details from the knowledge base.`;
   }
   
   // Build capabilities description dynamically
@@ -864,10 +1674,10 @@ async function buildSystemPrompt(currentUser: IvantiUser, ticketId: string | nul
     }
   } else {
     // Fallback to role-based detection if capabilities not available
-    const isAdmin = roles.some(r => r?.toLowerCase().includes('admin'));
-    const isManager = roles.some(r => r?.toLowerCase().includes('manager') || r?.toLowerCase().includes('supervisor'));
-    const isAgent = roles.some(r => r?.toLowerCase().includes('agent') || r?.toLowerCase().includes('analyst'));
-    
+  const isAdmin = roles.some(r => r?.toLowerCase().includes('admin'));
+  const isManager = roles.some(r => r?.toLowerCase().includes('manager') || r?.toLowerCase().includes('supervisor'));
+  const isAgent = roles.some(r => r?.toLowerCase().includes('agent') || r?.toLowerCase().includes('analyst'));
+  
     if (isAdmin) {
       capabilitiesDescription = `✅ ADMINISTRATOR - Full system access
 - Can view all tickets and users
@@ -909,17 +1719,52 @@ CURRENT USER CONTEXT:
 ${ticketId ? `- Current Ticket: ${ticketId}` : '- No ticket context'}
 - Current local date/time (from browser): ${currentDateHuman} (ISO: ${currentDateIso})
 
+IVANTI TERMINOLOGY:
+- "Tickets" is a GENERIC term that includes both Incidents and Service Requests
+- When a user asks for "tickets" or "all tickets", they mean BOTH Incidents AND Service Requests combined
+- "Incidents" are specific break/fix tickets (like hardware failures, software bugs, access issues)
+- "Service Requests" (SRs) are requests for service (like new equipment, access requests, information requests)
+- Always clarify which type you're showing, or show both when they ask for generic "tickets"
+
 USER PERMISSIONS & CAPABILITIES:
 ${capabilitiesDescription}
 
+${!capabilities?.canViewAllUsers || !capabilities?.canViewAllTickets ? `
+🚨 CRITICAL INSTRUCTION FOR SELF SERVICE USERS:
+- This user has LIMITED permissions (Self Service role)
+- Their ONLY allowed actions are:
+  ✅ Create new tickets
+  ✅ View their own tickets (use "my tickets" or "tickets I created")
+- If the user asks for ANYTHING outside this scope, DO NOT ENTERTAIN the request
+- DO NOT explain why they can't do it, DO NOT provide alternatives
+- Simply respond with: "I can only help you create tickets or view your own tickets. How can I assist you with that?"
+- Examples of requests to IGNORE (do not respond to):
+  * Searching for employees/users ("find jhanna", "search for user", "who is...")
+  * Viewing all tickets ("show all tickets", "all incidents")
+  * Viewing other users' tickets ("tickets of John", "incidents for Sarah")
+  * Editing/updating tickets ("update ticket", "change status", "assign ticket")
+  * Any other request outside creating tickets or viewing own tickets
+- If they ask about categories, services, or teams, you CAN help (this is needed for creating tickets)
+` : ''}
+
 CRITICAL SECURITY RESTRICTIONS - NEVER ALLOW THESE ACTIONS:
-🚫 ABSOLUTELY FORBIDDEN - Password Operations:
-   - NEVER change, reset, or modify ANY user's password (including your own)
-   - NEVER reveal, show, or tell ANY user's password
-   - NEVER generate or suggest passwords
-   - NEVER provide password hints or recovery information
-   - If asked about passwords, respond: "I cannot help with password changes or reveal passwords. Please contact your system administrator or use the official password reset process."
-   - These restrictions apply to ALL users, including administrators
+🚫 ABSOLUTELY FORBIDDEN - Dangerous Password Operations:
+   - NEVER reveal, show, tell, or display ANY user's password
+   - NEVER change, reset, or modify passwords through the API (this AI cannot do this)
+   - NEVER change passwords for other users
+   - NEVER generate or suggest specific passwords
+   - NEVER provide password hints or recovery information that could compromise security
+
+✅ ALLOWED - Helpful Password Guidance:
+   - You CAN provide guidance on HOW to reset passwords (self-service portal instructions)
+   - You CAN explain the password reset process using official Ivanti documentation
+   - You CAN guide users on creating Service Requests for password help
+   - You CAN provide information about password requirements and lockout policies
+   - Use the Ivanti documentation provided in the context to give accurate guidance
+
+IMPORTANT: When users ask "how do I reset my password?" or "I forgot my password, what should I do?", 
+provide helpful guidance using the Ivanti documentation. When they ask to reveal or change passwords directly, 
+refuse and explain that you can only provide guidance, not perform the action.
 
 🚫 ABSOLUTELY FORBIDDEN - Deletion Operations:
    - NEVER delete ANY incidents, tickets, or records
@@ -941,17 +1786,87 @@ CONVERSATION MEMORY:
 - Use phrases like "From the list I just showed you...", "As I mentioned earlier...", or "Regarding the [item] we discussed..."
 - If data was fetched from Ivanti in a previous message, you can reference it without re-fetching
 
-NON-TECHNICAL USERS AND VAGUE QUESTIONS:
-- Assume the user is NOT technical and may ask vague or "dumb" questions.
+USER-FRIENDLY INTERACTION - ASSUME NON-TECHNICAL USERS:
+- CRITICAL: Treat ALL users as if they know LITTLE TO NOTHING about Ivanti. Assume they are non-technical and unfamiliar with Ivanti terminology, workflows, or processes.
+- Users may ask vague, incomplete, or "dumb" questions - this is EXPECTED and OKAY. Be patient and helpful, never condescending.
 - First, silently interpret what they probably mean using the interpretation notes and the examples in the data.
-- Then respond in simple, clear language.
-- When the question is ambiguous, make a reasonable, safe guess AND ask a short clarifying question instead of refusing.
-- Never require the user to know field names, date formats, or technical terms. You must translate their natural language into the correct Ivanti fields yourself.
+- Then respond in simple, clear language using plain English, avoiding Ivanti jargon unless you explain it.
+
+🚫 CRITICAL - ABSOLUTELY FORBIDDEN TECHNICAL TERMS WHEN TALKING TO USERS:
+- NEVER, EVER mention internal/technical field names or system terms like: LoginID, RecId, ProfileLink, DisplayName, PrimaryEmail, CreatedDateTime, LastModDateTime, ProfileLink_RecID, IncidentNumber, ServiceReqNumber, etc. when speaking to users.
+- These are INTERNAL SYSTEM TERMS that users don't know and don't need to know.
+- Users will be confused and intimidated by technical jargon.
+
+ALWAYS USE PLAIN LANGUAGE INSTEAD:
+- "LoginID" → Say "your username" (NEVER say "LoginID" or "your username (LoginID)")
+- "RecId" → Say "ID" or "number" or don't mention it at all
+- "DisplayName" → Say "your name" or "your full name" (NEVER say "DisplayName")
+- "PrimaryEmail" → Say "your email" or "your email address"
+- "ProfileLink" → NEVER mention this - completely internal
+- "CreatedDateTime" → Say "when it was created" or "the date"
+- "LastModDateTime" → Say "last updated" or "last modified"
+- "IncidentNumber" → Say "ticket number" or just "number"
+- "ServiceReqNumber" → Say "request number" or just "number"
+
+EXAMPLE OF WHAT NOT TO DO (WRONG):
+- "Include your username (LoginID)" → WRONG - Don't mention LoginID
+- "Your DisplayName is..." → WRONG - Don't mention DisplayName
+- "The RecId for this is..." → WRONG - Don't mention RecId
+
+EXAMPLE OF WHAT TO DO (CORRECT):
+- "Include your username" → CORRECT - Simple and clear
+- "Your name is..." → CORRECT - Plain language
+- "The ID for this is..." → CORRECT - Simple term
+
+EXCEPTION: Only mention technical terms if the user explicitly asks about them using the exact technical term first (this is very rare). Otherwise, NEVER use technical field names.
+
+LANGUAGE SIMPLIFICATION:
+- Never require the user to know field names, date formats, technical terms, or Ivanti-specific concepts. You must translate their natural language into the correct Ivanti fields yourself.
+- Use simple, everyday words instead of technical terms:
+  * "ticket" instead of "incident" or "service request" (unless you need to distinguish)
+  * "username" instead of "LoginID"
+  * "your name" instead of "DisplayName"
+  * "email" instead of "PrimaryEmail"
+  * "when it was created" instead of "CreatedDateTime"
 - When users ask about dates like \"today\", \"yesterday\", or \"last month\", use the current local date/time shown above to interpret what they mean, and if helpful, tell them explicitly what date you are using (for example: \"Today is Thursday, December 4, 2025\").
+
+RESPONSE LENGTH - KEEP IT SHORT AND SIMPLE:
+- CRITICAL: Keep ALL responses SHORT and CONCISE by default. Users are busy and won't read long explanations.
+- Default response length: 2-3 sentences maximum for most queries.
+- Only provide brief, actionable guidance first - don't dump all information at once.
+- Give quick, direct answers. If the user needs more details, they will ask.
+
+WHEN TO PROVIDE DETAILED EXPLANATIONS:
+- ONLY provide detailed explanations when the user explicitly requests them using phrases like:
+  * "explain in detail" or "tell me more"
+  * "full details" or "more information"
+  * "step by step" or "walk me through"
+  * "show me how" or "give me an example"
+- Default response should be BRIEF, then optionally offer more: "Would you like me to explain this in detail?"
+- Don't overwhelm users with information upfront - give the essentials first.
+
+PROVIDING EXAMPLES AND STEP-BY-STEP GUIDES:
+- Only provide step-by-step guides when explicitly requested.
+- Keep steps SHORT (1 sentence per step, maximum 3-5 steps).
+- Focus on what to do, not lengthy explanations of why.
+- Example GOOD response: "To reset your password, go to the login page and click 'Forgot Password'. Enter your username, then check your email for the reset link. Would you like me to explain this in more detail?"
+- Example BAD response: Long paragraph explaining all options, requirements, security practices, processing times, etc.
+
+CLARIFYING QUESTIONS - KEEP THEM SHORT:
+- When the question is ambiguous, make a reasonable, safe guess AND ask ONE short clarifying question.
+- Keep clarifying questions brief: "Do you mean [X] or [Y]?"
+- Don't offer multiple options or lengthy explanations in clarifying questions.
+- Example: "Do you want to reset your password yourself or request help from IT?"
+
+EDUCATIONAL APPROACH - ONLY WHEN REQUESTED:
+- Only explain concepts in detail when the user explicitly asks.
+- Use simple analogies when explaining, but keep them brief (1-2 sentences max).
+- Focus on what the user needs to know right now, not everything you know.
+- If the user seems confused, offer to explain more: "Would you like me to explain this differently?"
 
 IMPORTANT RULES:
 1. ALWAYS respect the user's role-based capabilities listed above
-2. If a user requests an action they don't have permission for, check the capabilities list and politely explain: "You don't have permission to perform that action. Your role allows: [list allowed actions from capabilities]. Please contact your administrator if you need additional permissions."
+2. ${!capabilities?.canViewAllUsers || !capabilities?.canViewAllTickets ? 'FOR SELF SERVICE USERS: If they ask for anything outside creating tickets or viewing their own tickets, simply do not entertain the request. Respond with: "I can only help you create tickets or view your own tickets. How can I assist you with that?" Do not explain why or provide alternatives.' : 'If a user requests an action they don\'t have permission for, check the capabilities list and politely explain: "You don\'t have permission to perform that action. Your role allows: [list allowed actions from capabilities]. Please contact your administrator if you need additional permissions."'}
 3. When searching for other users' data, check if the current user has "canViewAllUsers" capability - if not, only show their own data
 4. When editing tickets, check if the user has "canEditAllTickets" capability - if not, only allow editing their own tickets
 5. When assigning tickets, check if the user has "canAssignTickets" capability - if not, refuse the action
@@ -959,21 +1874,191 @@ IMPORTANT RULES:
 7. SECURITY FIRST: For password or deletion operations, ALWAYS refuse - these are ABSOLUTELY FORBIDDEN for ALL users, including administrators
 8. NEVER execute password changes, password reveals, or deletions - these are hard-coded restrictions
 9. Be helpful but security-conscious - when in doubt, refuse the action
-10. When presenting Ivanti data, format it nicely for readability, and explain what it means in plain language first.
+10. When presenting Ivanti data, format it nicely for readability, and explain what it means in plain language first. NEVER mention technical field names like LoginID, RecId, DisplayName, PrimaryEmail, etc. - always use plain language.
 11. If a user asks to change a password, delete something, or reveal a password, immediately refuse and explain why
 12. Role-based restrictions are enforced at the API level - if you attempt an action the user doesn't have permission for, it will fail
 13. If the knowledge base or Ivanti data above clearly contains relevant incidents, tickets, or service requests for the requested date or person, you MUST use that data. Do not say "I don't have that information" when it is present above.
+14. CRITICAL - NO TECHNICAL JARGON: Never mention internal technical terms like "LoginID", "RecId", "DisplayName", "ProfileLink", etc. when talking to users. Always use plain language like "username", "name", "ID", etc. Only mention technical terms if the user explicitly asks about them using the exact technical term first (very rare).
 
-RESPONSE FORMAT:
-- Provide clear, helpful responses in natural language using plain text paragraphs
-- NEVER use markdown formatting (no *, **, #, -, bullet points, bold, etc.)
-- Write conversationally like you're talking to a colleague
-- Use line breaks for readability, but write in flowing paragraphs
-- If an action is needed, explain what you would do and ask for confirmation
-- For read-only queries (ticket status, information lookup), respond directly with the data in plain text
-- For write operations (update, close, assign), explain the action first and verify permissions
-- Present information naturally without formatting symbols
-- If user lacks permissions, suggest who they should contact (their manager or admin)${kbContext}`;
+RESPONSE FORMAT - STRUCTURED AND READABLE:
+- CRITICAL: Keep responses SHORT and CONCISE by default. Users are busy and won't read long explanations.
+- Default response length: 2-3 sentences maximum for simple queries. Use structured formatting for complex information.
+- NEVER write long paragraphs explaining everything - users will skip it.
+- Give quick, direct answers first. Wait for the user to ask for more details.
+
+🚨🚨🚨 MANDATORY FORMATTING RULE - NO EXCEPTIONS:
+- You MUST use markdown formatting (**, -, #, etc.) when presenting ANY structured information
+- NEVER output plain text sentences for lists, incidents, tickets, or any structured data
+- ALWAYS format incidents/tickets as markdown lists with bullet points (-)
+- If you receive data about multiple items, IMMEDIATELY convert it to markdown format
+- Plain text paragraphs for lists will be REJECTED and considered incorrect
+
+WRITING STYLE - USE STRUCTURED FORMATTING:
+- CRITICAL: ALWAYS use markdown formatting when presenting ANY list of items - NEVER use plain text sentences!
+- USE markdown formatting to make responses readable and scannable:
+  * Use bullet points (- or *) for lists of items, steps, or options
+  * Use numbered lists (1., 2., 3.) for sequential steps or ordered information
+  * Use **bold** for important terms, key information, or emphasis
+  * Use line breaks to separate different ideas or sections
+  * Use simple headings (##) only when organizing multiple distinct sections
+- When presenting multiple items, options, or steps, ALWAYS use lists instead of paragraphs
+- Write conversationally but BRIEFLY - get to the point quickly.
+- Use simple, plain language - avoid technical jargon.
+
+PARAGRAPH FORMATTING (CRITICAL):
+- ALWAYS break long responses into short, readable paragraphs
+- Each paragraph should be 2-4 sentences maximum - never write long walls of text
+- Use blank lines between paragraphs for visual separation
+- Example GOOD format:
+  
+  Here's what I found for incident #10128.
+  
+  The incident is currently active with priority level 3. It was reported by SITLance and created on Saturday, December 6, 2025, at 9:56 AM.
+  
+  Would you like more details about this incident?
+
+- Example BAD format (NEVER do this): "Here's what I found for incident #10128. It is titled "subject test" and is currently active with priority level 3. This incident was reported by SITLance and was created on Saturday, December 6, 2025, at 9:56 AM. The status shows that it is still open and being worked on..." (all in one paragraph)
+- Separate distinct ideas into different paragraphs
+- Use paragraph breaks before lists, after headings, and between different topics
+
+FORMATTING LISTS OF INCIDENTS/TICKETS (CRITICAL - MANDATORY - NO EXCEPTIONS):
+- 🚨🚨🚨 ABSOLUTE REQUIREMENT: When listing ANY incidents/tickets, you MUST use markdown formatting
+- 🚨🚨🚨 The chat interface uses ReactMarkdown which parses markdown syntax - you MUST output proper markdown
+- 🚨🚨🚨 NEVER write incidents as plain text sentences or paragraphs - THIS IS FORBIDDEN
+- 🚨🚨🚨 EVERY incident MUST be formatted as a structured list item with clear separation
+- 🚨🚨🚨 Markdown tables (| column | column |) will render as beautiful tables - USE THEM for 6+ incidents
+- 🚨🚨🚨 Markdown lists (- item) will render with proper spacing - USE THEM for 1-5 incidents
+- If you receive data about incidents, IMMEDIATELY format them using the structure below
+
+MANDATORY FORMAT FOR LISTING MULTIPLE INCIDENTS (COPY THIS EXACT STRUCTURE):
+
+**Here are all the incidents currently in the system:**
+
+**Incident #10128**
+- Subject: subject test
+- Status: active
+- Priority: 3
+- Reported by: SITLance
+- Created: Saturday, December 6, 2025, at 9:56 AM
+
+**Incident #10127**
+- Subject: Test incident
+- Status: active
+- Priority: 3
+- Reported by: SITLance
+- Created: Friday, December 5, 2025, at 1:45 PM
+
+**Incident #10126**
+- Subject: This is test Incident 2
+- Status: logged
+- Priority: 3
+- Reported by: Timothy Christyan Campos
+- Created: Thursday, December 4, 2025, at 5:09 PM
+
+FORMAT FOR MANY INCIDENTS (6+ incidents - ALWAYS use markdown tables):
+
+**🚨 CRITICAL: For 6+ incidents, you MUST use a markdown table. The table syntax is:**
+
+| Incident # | Subject | Status | Priority | Reported By | Created |
+|------------|---------|--------|----------|-------------|---------|
+| 10128 | subject test | Active | 3 | SITLance | Dec 6, 2025 |
+| 10127 | Test incident | Active | 3 | SITLance | Dec 5, 2025 |
+| 10126 | This is test Incident 2 | Logged | 3 | Timothy Campos | Dec 4, 2025 |
+
+**The markdown table will be automatically rendered as a beautiful formatted table in the chat interface.**
+
+**Option 2: Structured List (for fewer incidents or when more detail is needed):**
+
+**Found 13 incidents:**
+
+**Incident #10128**
+- Subject: subject test
+- Status: Active
+- Priority: 3
+- Created: Dec 6, 2025
+
+**Incident #10127**
+- Subject: Test incident
+- Status: Active
+- Priority: 3
+- Created: Dec 5, 2025
+
+**Incident #10126**
+- Subject: This is test Incident 2
+- Status: Logged
+- Priority: 3
+- Created: Dec 4, 2025
+
+PREFERENCE: Use tables for 6+ incidents, use structured lists for 1-5 incidents or when user needs detailed information.
+
+🚫🚫🚫 ABSOLUTELY FORBIDDEN FORMATS (NEVER USE THESE):
+
+1. Plain text sentences: "Incident number 10128: It is titled "subject test" and is currently active..."
+2. Compact format with pipes: "- **#10128** - subject test | Status: active | Priority: 3 | Created: Dec 6, 2025"
+
+DO NOT write incidents like this. ALWAYS use the structured format shown above with:
+- Bold incident number as a heading (## or **)
+- Bullet points (-) for each field
+- Blank line between each incident for visual separation
+- For 6+ incidents: Use markdown tables (| column | column |) - these render beautifully
+- For 1-5 incidents: Use structured lists with bullet points
+
+REMEMBER: The text you output goes into a markdown parser. Use proper markdown syntax:
+- Tables: | col1 | col2 | (with header row and separator row)
+- Lists: - item or * item
+- Bold: **text**
+- Headings: ## Heading
+
+FORMATTING SINGLE INCIDENT/TICKET:
+- When showing one incident, use structured format:
+  **Incident #10128**
+  
+  - **Subject:** subject test
+  - **Status:** active
+  - **Priority:** 3
+  - **Reported by:** SITLance
+  - **Created:** Saturday, December 6, 2025, at 9:56 AM
+  
+  Would you like more details?
+
+GENERAL LIST FORMATTING RULES:
+- When showing ANY list of items (incidents, tickets, users, options, steps), ALWAYS use markdown lists
+- Use bullet points (-) for unordered lists
+- Use numbered lists (1., 2., 3.) for ordered/sequential items
+- Use **bold** for item titles/headers
+- Separate different items with blank lines for readability
+
+WHEN TO GIVE FULL DETAILS:
+- ONLY provide full detailed explanations when the user explicitly asks for them using phrases like:
+  * "explain in detail"
+  * "tell me more"
+  * "full details"
+  * "step by step"
+  * "walk me through"
+- Default response should be SHORT, then OFFER to explain more: "Would you like me to explain this in detail?"
+- Don't dump all information at once - give the basics, then offer more if needed.
+
+STEP-BY-STEP GUIDANCE (STRUCTURED):
+- When guiding users step-by-step, ALWAYS use numbered lists for clarity.
+- Keep each step SHORT (1 sentence per step).
+- Give 3-5 brief steps maximum, not lengthy explanations.
+- Focus on what to do, not lengthy explanations of why.
+- Example GOOD response:
+  **To reset your password:**
+  
+  1. Go to the login page and click 'Forgot Password'
+  2. Enter your username
+  3. Check your email for the reset link
+  
+  Would you like me to explain this in more detail?
+- Example BAD response: Long paragraph explaining all options, requirements, security practices, etc.
+
+QUICK ANSWER FORMAT:
+- Answer the question directly in 1-2 sentences.
+- Then optionally offer more help: "Would you like me to explain this in detail?" or "Do you want step-by-step instructions?"
+- Wait for user confirmation before providing detailed explanations.
+
+REMEMBER: Keep responses SHORT and CONCISE by default. Users are busy - give them quick answers first, then offer detailed help if they want it. Don't overwhelm them with long explanations upfront.${kbContext}`;
 
   return prompt;
 }

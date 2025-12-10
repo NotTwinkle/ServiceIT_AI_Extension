@@ -322,6 +322,13 @@ export async function fetchServiceRequests(top: number = 50): Promise<IvantiServ
 
     if (!response.ok) {
       const errorText = await response.text();
+      
+      // Handle 401 (Unauthorized) gracefully - session expired or invalid
+      if (response.status === 401) {
+        console.warn(`[IvantiData] ⚠️ Session expired or invalid (401) - skipping service requests fetch. This is normal after logout/login.`);
+        return [];
+      }
+      
       console.error(`[IvantiData] ❌ Failed to fetch service requests: ${response.status}`, errorText);
       return [];
     }
@@ -958,6 +965,13 @@ export async function fetchCategories(top: number = 25): Promise<IvantiCategory[
 
     if (!response.ok) {
       const errorText = await response.text().catch(() => 'Unable to read error response');
+      
+      // Handle 401 (Unauthorized) gracefully - session expired or invalid
+      if (response.status === 401) {
+        console.warn(`[IvantiData] ⚠️ Session expired or invalid (401) - skipping categories fetch. This is normal after logout/login.`);
+        return [];
+      }
+      
       console.error(`[IvantiData] ❌ Failed to fetch categories: ${response.status} - ${errorText}`);
       return [];
     }

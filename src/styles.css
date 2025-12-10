@@ -72,6 +72,25 @@
   animation: bounce 1.4s ease-in-out infinite;
 }
 
+/* Responsive design helpers for theme editor */
+#serviceit-assistant-root {
+  /* Ensure proper box-sizing for all elements */
+  box-sizing: border-box;
+}
+
+#serviceit-assistant-root *,
+#serviceit-assistant-root *::before,
+#serviceit-assistant-root *::after {
+  box-sizing: border-box;
+}
+
+/* Responsive text overflow */
+#serviceit-assistant-root .sit-text-ellipsis {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 #serviceit-assistant-root .sit-animate-pulse-ring {
   animation: pulse-ring 2s cubic-bezier(0.215, 0.61, 0.355, 1) infinite;
 }
@@ -97,6 +116,69 @@
   40% {
     transform: translateY(-6px);
   }
+}
+
+/* Improved markdown content styling for AI responses */
+#serviceit-assistant-root .markdown-content p:last-child,
+#serviceit-assistant-root .markdown-content ul:last-child,
+#serviceit-assistant-root .markdown-content ol:last-child,
+#serviceit-assistant-root .markdown-content blockquote:last-child,
+#serviceit-assistant-root .markdown-content h2:last-child,
+#serviceit-assistant-root .markdown-content h3:last-child {
+  margin-bottom: 0 !important;
+}
+
+/* Professional text formatting for AI responses */
+#serviceit-assistant-root .markdown-content {
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Professional text formatting for paragraphs - left-aligned for readability */
+#serviceit-assistant-root .markdown-content p {
+  text-align: left !important;
+  max-width: 100%;
+  overflow-wrap: break-word;
+  word-wrap: break-word;
+  hyphens: auto;
+  margin-bottom: 18px;
+  line-height: 1.8;
+}
+
+/* Keep lists left-aligned for readability with proper spacing */
+#serviceit-assistant-root .markdown-content ul,
+#serviceit-assistant-root .markdown-content ol {
+  text-align: left !important;
+  max-width: 100%;
+  margin-bottom: 20px;
+  padding-left: 26px;
+  list-style-position: outside;
+  line-height: 1.8;
+}
+
+#serviceit-assistant-root .markdown-content li {
+  text-align: left !important;
+  max-width: 100%;
+  overflow-wrap: break-word;
+  margin-bottom: 8px;
+  line-height: 1.8;
+  font-size: 15px;
+}
+
+/* Better spacing for headings in lists */
+#serviceit-assistant-root .markdown-content h2 {
+  margin-top: 20px;
+  margin-bottom: 10px;
+  line-height: 1.5;
+}
+
+/* Ensure proper text organization and spacing */
+#serviceit-assistant-root .markdown-content {
+  max-width: 100%;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+  line-height: 1.8;
 }
 
 /* Message Entry Animation */
@@ -198,12 +280,39 @@
   }
 }
 
+/* Progress bar shimmer effect */
+@keyframes sit-progress-shimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
 @keyframes sit-spin {
   from {
     transform: rotate(0deg);
   }
   to {
     transform: rotate(360deg);
+  }
+}
+
+/* Step-by-step thinking indicator animations (like Cursor) */
+#serviceit-assistant-root .sit-spin {
+  animation: sit-spin 0.8s linear infinite;
+}
+
+/* Thinking dots animation (like ChatGPT/Gemini) */
+@keyframes sit-thinking-dot {
+  0%, 60%, 100% {
+    opacity: 0.3;
+    transform: scale(0.8);
+  }
+  30% {
+    opacity: 1;
+    transform: scale(1);
   }
 }
 
@@ -220,17 +329,7 @@
   }
 }
 
-/* Smooth fade-in animation for show button */
-@keyframes sit-fade-in {
-  from {
-    opacity: 0;
-    transform: scale(0.8);
-  }
-  to {
-    opacity: 1;
-    transform: scale(1);
-  }
-}
+/* Smooth fade-in animation for show button (reusing sit-fade-in defined above) */
 
 /* Smooth slide animations for hide button */
 @keyframes sit-slide-down {
@@ -252,6 +351,133 @@
 #serviceit-assistant-root button:focus-visible {
   outline: 2px solid #002b5c;
   outline-offset: 2px;
+}
+
+/* Enhanced table styling (ChatGPT-style) */
+#serviceit-assistant-root .markdown-content table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 20px 0;
+  font-size: 14px;
+  background-color: #ffffff;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+}
+
+#serviceit-assistant-root .markdown-content table thead {
+  background-color: #f9fafb;
+}
+
+#serviceit-assistant-root .markdown-content table th {
+  padding: 12px 16px;
+  text-align: left;
+  font-weight: 600;
+  color: #1f2937;
+  font-size: 13px;
+  letter-spacing: 0.01em;
+  border-bottom: 2px solid #e5e7eb;
+}
+
+#serviceit-assistant-root .markdown-content table td {
+  padding: 12px 16px;
+  text-align: left;
+  color: #374151;
+  font-size: 14px;
+  line-height: 1.6;
+  border-bottom: 1px solid #f3f4f6;
+}
+
+#serviceit-assistant-root .markdown-content table tbody tr:hover {
+  background-color: #f9fafb;
+}
+
+#serviceit-assistant-root .markdown-content table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+/* Enhanced list formatting for incidents (card-like appearance) */
+/* Better visual hierarchy for incident lists - add spacing between items */
+#serviceit-assistant-root .markdown-content > ul > li {
+  margin-bottom: 20px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid #f3f4f6;
+}
+
+#serviceit-assistant-root .markdown-content > ul > li:last-child {
+  border-bottom: none;
+  margin-bottom: 0;
+  padding-bottom: 0;
+}
+
+/* Enhanced incident number styling - make bold incident numbers stand out */
+#serviceit-assistant-root .markdown-content ul li strong {
+  display: inline-block;
+  margin-bottom: 8px;
+  font-size: 15px;
+  color: #002b5c;
+  font-weight: 600;
+}
+
+/* Better spacing for nested lists (incident details) */
+#serviceit-assistant-root .markdown-content ul ul {
+  margin-top: 8px;
+  margin-bottom: 0;
+  padding-left: 24px;
+}
+
+#serviceit-assistant-root .markdown-content ul ul li {
+  margin-bottom: 6px;
+  font-size: 14px;
+  color: #6b7280;
+  list-style-type: circle;
+  line-height: 1.6;
+}
+
+/* Card-like styling for structured data blocks (lists after headings/paragraphs) */
+#serviceit-assistant-root .markdown-content p + ul,
+#serviceit-assistant-root .markdown-content h2 + ul,
+#serviceit-assistant-root .markdown-content h3 + ul {
+  margin-top: 12px;
+  padding: 16px;
+  background-color: #f9fafb;
+  border-radius: 8px;
+  border: 1px solid #e5e7eb;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+}
+
+/* Better spacing for lists containing incidents */
+#serviceit-assistant-root .markdown-content ul {
+  margin-bottom: 20px;
+}
+
+/* Enhanced paragraph spacing before lists */
+#serviceit-assistant-root .markdown-content p:has(+ ul) {
+  margin-bottom: 12px;
+}
+
+/* Improved visual separation for incident entries */
+#serviceit-assistant-root .markdown-content ul li {
+  position: relative;
+  padding-left: 4px;
+}
+
+/* Better formatting for nested content in lists */
+#serviceit-assistant-root .markdown-content ul li p {
+  margin-top: 8px;
+  margin-bottom: 8px;
+}
+
+/* Pulse animation for theme preview loading dots */
+@keyframes pulse {
+  0%, 100% {
+    opacity: 0.7;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.1);
+  }
 }
 
 
