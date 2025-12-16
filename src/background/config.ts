@@ -52,8 +52,8 @@ export const IVANTI_CONFIG = {
 };
 
 export const AI_CONFIG = {
-  // AI Provider Selection: 'gemini' or 'ollama'
-  provider: (import.meta.env.VITE_AI_PROVIDER || 'gemini').toLowerCase() as 'gemini' | 'ollama',
+  // AI Provider Selection: 'gemini', 'ollama', or 'grok'
+  provider: (import.meta.env.VITE_AI_PROVIDER || 'gemini').toLowerCase() as 'gemini' | 'ollama' | 'grok',
   
   // Google Gemini API Configuration
   // Get your API key from: https://ai.google.dev/
@@ -84,12 +84,36 @@ export const AI_CONFIG = {
   // - 'mistral' - Mistral 7B
   // - 'qwen2.5' - Qwen 2.5
   // - 'phi3' - Phi-3
-  ollamaModel: import.meta.env.VITE_OLLAMA_MODEL || 'llama3.2',
+  ollamaModel: import.meta.env.VITE_OLLAMA_MODEL || 'llama3:latest',
+  
+  // xAI Grok Configuration
+  // Get your API key from: https://console.x.ai/
+  // Set VITE_GROK_API_KEY in .env.local, e.g.:
+  //   VITE_GROK_API_KEY=xai-your-key-here
+  grokApiKey: import.meta.env.VITE_GROK_API_KEY || '',
+  // Available Grok models (2025):
+  // - 'grok-beta' - Latest Grok model (recommended) ⭐ FREE
+  // - 'grok-2' - Grok 2 (stable)
+  // - 'grok-vision-beta' - Grok with vision capabilities
+  grokModel: import.meta.env.VITE_GROK_MODEL || 'grok-beta',
+  grokApiUrl: 'https://api.x.ai/v1',
   
   // Legacy support (for backward compatibility)
-  get apiKey() { return this.geminiApiKey; },
-  get model() { return this.provider === 'ollama' ? this.ollamaModel : this.geminiModel; },
-  get apiUrl() { return this.provider === 'ollama' ? this.ollamaUrl : this.geminiApiUrl; },
+  get apiKey() { 
+    if (this.provider === 'grok') return this.grokApiKey;
+    if (this.provider === 'ollama') return '';
+    return this.geminiApiKey;
+  },
+  get model() { 
+    if (this.provider === 'grok') return this.grokModel;
+    if (this.provider === 'ollama') return this.ollamaModel;
+    return this.geminiModel;
+  },
+  get apiUrl() { 
+    if (this.provider === 'grok') return this.grokApiUrl;
+    if (this.provider === 'ollama') return this.ollamaUrl;
+    return this.geminiApiUrl;
+  },
   
   temperature: 0.7,
   maxOutputTokens: 1500,
@@ -343,7 +367,13 @@ YOUR RESPONSIBILITIES:
    - REQUIRED FIELDS (must always be provided):
      * Subject (required): Brief title of the issue
      * Symptom/Description (required): Detailed problem description
-     * Category (REQUIRED): Type of issue - MUST be provided! Common values: "Service Desk", "Ivanti Neurons for ITSM", "Connectivity", etc.
+     * Category (REQUIRED): Type of issue - MUST be a VALID category from Ivanti's validation list
+   - ⚠️ CRITICAL: Category MUST match exact values from Ivanti's validation list
+     * Valid categories are provided in [KNOWLEDGE BASE] or [DATA FETCHED FROM IVANTI] sections
+     * Categories are case-sensitive and must match EXACTLY (e.g., "Service Desk" not "service desk" or "IT Issue")
+     * If user says "IT issue" or "it issue", match it to a valid category like "Service Desk" or "Ivanti Neurons for ITSM"
+     * NEVER use made-up category values - they will be rejected by Ivanti
+     * Common valid categories: "Service Desk", "Ivanti Neurons for ITSM", "Connectivity", "iBoss", etc.
    - OPTIONAL FIELDS:
      * Priority (optional): How urgent (1-5, where 1 is most urgent)
      * Source (optional): How it was reported - MUST be one of: "Phone", "Email", "Chat", "Self Service"
@@ -351,24 +381,78 @@ YOUR RESPONSIBILITIES:
      * Service (optional): Service area
    - When user wants to create an incident:
      * ALWAYS ask for Category if not provided - it's REQUIRED by Ivanti
-     * Ask: "What category does this fall under? (e.g., Service Desk, IT Issue, Network Problem, etc.)"
-     * If user doesn't know, offer to suggest categories (you can fetch them automatically)
-   - When you have ALL required fields (Subject, Symptom, AND Category), output this EXACT format:
+     * Use categories from the knowledge base/context - they are the valid ones for this Ivanti instance
+     * Ask: "What category does this fall under? I can see these available categories: [list from knowledge base]"
+     * If user provides a category that doesn't match exactly, match it to the closest valid category
+     * Example: User says "IT issue" → Use "Service Desk" (if that's a valid category in the system)
+   - When you have ALL required fields (Subject, Symptom, AND a VALID Category), output this EXACT format:
      CREATE_INCIDENT: {"Subject": "title here", "Symptom": "description here", "Category": "Service Desk", "Priority": "optional"}
    - IMPORTANT RULES:
-     * Category is MANDATORY - never create without it
+     * Category is MANDATORY and must be EXACT match from Ivanti's validation list
+     * Use the EXACT category name from the knowledge base (case-sensitive)
      * Only include Source if user specifies how they're reporting. Valid values: "Phone", "Email", "Chat", "Self Service"
      * Do NOT use "Web Client" as Source - it's not valid. Use "Self Service" for web-based reports.
+     * If you're unsure about the category, check the knowledge base for valid categories
    - After outputting CREATE_INCIDENT, continue with a friendly message like "I'm creating the incident now..."
+   
+   ⚠️ CRITICAL: DO NOT output CREATE_SERVICE_REQUEST markers!
+   - Service Requests work DIFFERENTLY from Incidents
+   - For Service Requests, the system will automatically create a draft action when you suggest an offering
+   - NEVER output: CREATE_SERVICE_REQUEST: {"SubscriptionId": "...", ...}
+   - Instead, just describe what you're doing in natural language: "I've prepared a service request form for you..."
+   - The confirmation card will appear automatically when ready - you don't need to trigger it with markers
+   - If you see internal markers like CREATE_SERVICE_REQUEST in your response, REMOVE them before sending to the user
+
+   ⛔ CRITICAL: NEVER say you "submitted" or "created" a Service Request!
+   - You CAN ONLY prepare drafts - the USER must click "Confirm & Submit" to actually create the SR
+   - NEVER say: "I have submitted your Service Request"
+   - NEVER say: "Service Request SR##### has been created"
+   - NEVER make up Service Request numbers (SR####)
+   - ONLY say: "I've prepared the Service Request form for you. Please review it and click 'Confirm & Submit' to create the request."
+   - After the user clicks "Confirm & Submit", the system will tell you the real SR number - THEN you can announce it
+
+   📋 SERVICE REQUEST FLOW - THINK THROUGH THIS CAREFULLY:
+   
+   **UNDERSTAND THE FLOW:**
+   1. User asks for something → You suggest a Request Offering
+   2. User says "yes" / "its up to you" / "just do it" → You create a DRAFT (not submitted!)
+   3. System shows a confirmation form with fields → User reviews and edits
+   4. User clicks "Confirm & Submit" button → THEN the Service Request is actually created
+   5. System tells you the real SR number → THEN you can announce it
+   
+   **CRITICAL RULES:**
+   - When user says "yes" after you suggest an offering:
+     ✅ DO: Create the draft action (system will handle this automatically)
+     ✅ DO: Say "I've prepared the Service Request form for you. Please review the details below and click 'Confirm & Submit' to create the request."
+     ✅ DO: Acknowledge their "yes" - show you understood
+     ❌ DON'T: Say "I've submitted" or "I've created" - you only PREPARED a draft
+     ❌ DON'T: Make up SR numbers like "SR 10089" - they don't exist yet!
+   
+   - When user says "its up to you" / "just do it" / "no more questions":
+     ✅ DO: Immediately create the draft with sensible defaults
+     ✅ DO: Fill in Subject, Description, Category based on conversation
+     ✅ DO: Be confident and proceed - user trusts you
+     ❌ DON'T: Ask for more information - you have enough context
+     ❌ DON'T: Say "please provide" - you're making the decisions
+   
+   **REMEMBER:**
+   - "Prepared" = Draft created, waiting for user to click button
+   - "Submitted" = User clicked button, Service Request actually created in Ivanti
+   - You can ONLY prepare drafts - the USER must click the button to submit
+   - The confirmation form will appear automatically when you create the draft action
    
    UPDATING INCIDENTS:
    - When user wants to update/edit an incident, you need:
      * IncidentNumber (required): The incident number (e.g., "10104")
-     * Fields to update: Subject, Symptom, Status, Priority, Category, Owner, Resolution, etc.
+     * Fields to update: Subject, Symptom, Status, Priority, Category, Owner, Resolution, CauseCode, etc.
    - When you have the incident number and fields to update, output this EXACT format:
-     UPDATE_INCIDENT: {"IncidentNumber": "10104", "Status": "Resolved", "Resolution": "Fixed the issue", "Priority": "3"}
+     UPDATE_INCIDENT: {"IncidentNumber": "10104", "Status": "Resolved", "CauseCode": "Fixed", "Resolution": "Fixed the issue", "Priority": "3"}
+   - ⚠️ CRITICAL: When updating status to "Resolved", you MUST include CauseCode field
+   - CauseCode is REQUIRED by Ivanti when status is "Resolved"
+   - Common CauseCode values: "Fixed", "Resolved", "Completed", "No Problem Found", "User Error", "Training Provided"
+   - If user doesn't provide CauseCode when resolving, use "Fixed" as a default value
    - You can update multiple fields at once
-   - Common updates: Status (Logged, Active, Resolved, Closed), Priority, Owner, Resolution
+   - Common updates: Status (Logged, Active, Resolved, Closed), Priority, Owner, Resolution, CauseCode
    
    DELETING INCIDENTS:
    - When user wants to delete an incident, you need:
@@ -420,6 +504,11 @@ export function validateConfig(): { valid: boolean; errors: string[] } {
     if (!AI_CONFIG.ollamaUrl || AI_CONFIG.ollamaUrl === '') {
       errors.push('Ollama URL is missing. Please set VITE_OLLAMA_URL in a local .env or .env.local file.');
       errors.push('Example: VITE_OLLAMA_URL=http://192.168.2.155:11434');
+    }
+  } else if (AI_CONFIG.provider === 'grok') {
+    if (!AI_CONFIG.grokApiKey || AI_CONFIG.grokApiKey === '') {
+      errors.push('Grok API key is missing. Please set VITE_GROK_API_KEY in a local .env or .env.local file.');
+      errors.push('Get your API key from: https://console.x.ai/ and add VITE_GROK_API_KEY=xai-your-key to .env.local');
     }
   }
   

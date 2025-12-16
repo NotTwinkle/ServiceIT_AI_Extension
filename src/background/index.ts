@@ -12,6 +12,7 @@ import { validateConfig } from './config';
 import { getCurrentUser, IvantiUser } from './services/userIdentity';
 import { processMessage, ChatMessage } from './services/aiService';
 import { prefetchCommonData } from './services/dataPrefetchService';
+import { fetchRequestOfferings, fetchRequestOfferingFieldset, normalizeRequestOfferingFieldset, createServiceRequest } from './services/ivantiDataService';
 
 // Store conversation history per tab (in memory)
 const conversationHistory = new Map<number, ChatMessage[]>();
@@ -410,6 +411,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
+  if (request.type === 'CONFIRM_SERVICE_REQUEST') {
+    handleConfirmServiceRequest(request, sender, sendResponse);
+    return true;
+  }
+
   if (request.type === 'CLEAR_CONVERSATION') {
     handleClearConversation(request, sender, sendResponse);
     return true;
@@ -612,7 +618,8 @@ async function handleSendMessage(request: any, sender: any, sendResponse: Functi
     sendResponse({
       success: true,
       message: aiResponse.message,
-      actions: aiResponse.actions || []
+      actions: aiResponse.actions || [],
+      thinkingSteps: aiResponse.thinkingSteps || [] // ✅ Pass agent thinking steps to UI
     });
 
   } catch (error: any) {
@@ -649,6 +656,140 @@ async function handleSendMessage(request: any, sender: any, sendResponse: Functi
       console.error('[Background] ❌ CRITICAL: Failed to send error response:', sendError);
       // If sendResponse fails, the chat will be stuck - log this for debugging
     }
+  }
+}
+
+/**
+ * Handle: CONFIRM_SERVICE_REQUEST
+ * Creates a Service Request from a selected Request Offering and field values
+ */
+async function handleConfirmServiceRequest(request: any, sender: any, sendResponse: Function) {
+  try {
+    const tabId = sender.tab?.id;
+    if (!tabId) {
+      sendResponse({ success: false, error: 'No tab ID' });
+      return;
+    }
+
+    let user = globalUserSession;
+    if (!user) {
+      sendResponse({ success: false, error: 'User not identified. Please refresh the page.' });
+      return;
+    }
+
+    const { subscriptionId, fieldValues } = request;
+    if (!subscriptionId || !fieldValues || typeof fieldValues !== 'object') {
+      sendResponse({ success: false, error: 'Missing subscriptionId or fieldValues' });
+      return;
+    }
+
+    console.log('[Background] CONFIRM_SERVICE_REQUEST for subscriptionId:', subscriptionId);
+    console.log('[Background] Field values received:', JSON.stringify(fieldValues, null, 2));
+    console.log('[Background] Field values keys:', Object.keys(fieldValues));
+
+    // For now we only validate and echo back; actual SR creation can be wired
+    // to a dedicated createServiceRequest helper later if needed.
+    const offerings = await fetchRequestOfferings();
+    const offering = offerings.find((o: any) =>
+      o.SubscriptionId === subscriptionId || o.strSubscriptionId === subscriptionId
+    );
+
+    if (!offering) {
+      sendResponse({ success: false, error: 'Request Offering not found for subscriptionId' });
+      return;
+    }
+
+    // ✅ Pass offering object to fetch correct template structure
+    const rawFieldset = await fetchRequestOfferingFieldset(subscriptionId, offering);
+    if (!rawFieldset) {
+      sendResponse({ success: false, error: 'Fieldset not found for Request Offering' });
+      return;
+    }
+
+    const normalized = normalizeRequestOfferingFieldset(rawFieldset, offering as any);
+
+    // Validate that all required fields are present
+    const missingRequired = normalized.fields
+      .filter(f => f.required)
+      .filter(f => {
+        const value = fieldValues[f.name];
+        return value === undefined || value === null || value === '' || String(value).trim() === '';
+      });
+
+    if (missingRequired.length > 0) {
+      const missingFieldsList = missingRequired.map(f => f.label || f.name).join(', ');
+      const errorMessage = `Cannot submit: ${missingRequired.length} required field${missingRequired.length > 1 ? 's are' : ' is'} missing: ${missingFieldsList}. Please fill in all required fields before submitting.`;
+      
+      console.warn('[Background] ⚠️ Validation failed - missing required fields:', missingRequired.map(f => f.label));
+      
+      sendResponse({
+        success: false,
+        error: errorMessage,
+        missingFields: missingRequired.map(f => ({ 
+          name: f.name, 
+          label: f.label || f.name,
+          type: f.type,
+          options: f.options || undefined
+        })),
+        // Add helpful context for UI
+        validationError: true,
+        missingFieldsCount: missingRequired.length
+      });
+      return;
+    }
+
+    // Create the service request via Ivanti REST API
+    console.log('[Background] Creating service request via Ivanti REST API...');
+    
+    // Extract field metadata (name, RecId, type, and options) for parameter mapping
+    const fieldMetadata = normalized.fields.map(f => ({
+      name: f.name,
+      recId: f.recId,
+      label: f.label,
+      type: f.type, // ✅ Include type for combo field handling
+      options: f.options // ✅ Include options for RecId lookup
+    }));
+    
+    console.log('[Background] 📋 Field metadata:', fieldMetadata);
+    
+    const createResult = await createServiceRequest(
+      {
+        subscriptionId,
+        fieldValues,
+        fieldMetadata // ✅ Pass field RecIds for Ivanti parameters mapping
+      },
+      user
+    );
+
+    if (!createResult.success) {
+      console.error('[Background] ❌ Failed to create service request:', createResult.error);
+      sendResponse({
+        success: false,
+        error: createResult.error || 'Failed to create service request'
+      });
+      return;
+    }
+
+    console.log('[Background] ✅ Service request created successfully:', createResult.requestNumber);
+
+    // Add created service request to conversation history so AI can reference it
+    const history = conversationHistory.get(tabId) || [];
+    history.push({
+      role: 'system',
+      content: `[SERVICE REQUEST CREATED - Remember this]: Service Request ${createResult.requestNumber} (RecId: ${createResult.recId || 'Unknown'}) was just created for offering "${normalized.name || 'Unknown Request Offering'}". This service request exists and user can ask about its status.`
+    });
+    conversationHistory.set(tabId, history);
+
+    sendResponse({
+      success: true,
+      created: true,
+      requestNumber: createResult.requestNumber,
+      recId: createResult.recId,
+      offeringName: normalized.name || 'Unknown Request Offering'
+    });
+  } catch (error: any) {
+    console.error('[Background] ❌ Error in CONFIRM_SERVICE_REQUEST:', error);
+    sendResponse({ success: false, error: error.message || 'Unknown error' });
   }
 }
 

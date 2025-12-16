@@ -15,6 +15,8 @@ export interface IvantiUser {
   email?: string;
   team?: string;
   department?: string;
+  location?: string;   // Optional: physical/site location if available
+  site?: string;       // Optional: alternative location/site field
   roles?: string[];
   teams?: string[];
   capabilities?: RoleCapabilities; // Role-based capabilities

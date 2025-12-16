@@ -8,7 +8,7 @@
  */
 
 import { IvantiUser } from './userIdentity';
-import { getUserTickets, fetchCategories, searchTickets } from './ivantiDataService';
+import { getUserTickets, fetchCategories, searchTickets, prefetchAllRequestOfferingsWithFieldsets } from './ivantiDataService';
 import { buildKnowledgeBase } from './knowledgeBaseService';
 
 export interface PrefetchProgress {
@@ -47,6 +47,17 @@ export async function prefetchCommonData(
         }
       });
       console.log('%c[Prefetch] ✅ Knowledge base built successfully!', 'color: #10b981; font-weight: bold; font-size: 14px;');
+      
+      // Pre-fetch ALL Request Offerings with their fieldsets (AI's complete knowledge)
+      if (onProgress) {
+        onProgress({
+          stage: 'request_offerings',
+          progress: 90,
+          message: 'Loading Request Offerings and fieldsets...'
+        });
+      }
+      await prefetchAllRequestOfferingsWithFieldsets();
+      console.log('%c[Prefetch] ✅ Request Offerings with fieldsets pre-fetched!', 'color: #10b981; font-weight: bold;');
     } catch (error) {
       console.error('[Prefetch] Error building knowledge base:', error);
       // Fall back to basic pre-fetching

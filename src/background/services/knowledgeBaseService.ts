@@ -260,10 +260,11 @@ export async function buildKnowledgeBase(
     
     try {
       console.log('%c[KnowledgeBase] 📥 Fetching recent incidents...', 'color: #3b82f6; font-weight: bold;');
-      // Ivanti has a 100-record limit per query, so we'll fetch in batches using pagination
+      // ENTERPRISE PATTERN: Aggressive prefetch for incidents (within 10MB budget)
+      // Note: Ivanti caps $top at 100 per request
       let rawIncidents: IvantiTicket[] = [];
-      const batchSize = 100;
-      const maxBatches = 3; // Fetch up to 300 incidents in 3 batches
+      const batchSize = 100;   // API limit per request
+      const maxBatches = 10;   // Up to 1,000 incidents max (fits comfortably under 10MB)
       
       for (let batch = 0; batch < maxBatches; batch++) {
         const skip = batch * batchSize;

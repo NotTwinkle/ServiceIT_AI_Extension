@@ -1,0 +1,516 @@
+{
+  "name": "Ivanti AI Intelligent Routing (Ollama + Gemini Agent)",
+  "nodes": [
+    {
+      "parameters": {
+        "requestMethod": "POST",
+        "url": "={{ $json.request.url }}",
+        "jsonParameters": true,
+        "options": {},
+        "bodyParametersJson": "={{ $json.request.body }}"
+      },
+      "id": "43b95a25-2789-4764-aa33-a32531553478",
+      "name": "Call Gemini (Complexity)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        -368,
+        64
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ivanti-ai",
+        "responseMode": "responseNode",
+        "options": {
+          "binaryPropertyName": ""
+        }
+      },
+      "id": "c679c354-8ae6-40ce-97a4-4af275863203",
+      "name": "Webhook - Ivanti AI",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1072,
+        64
+      ],
+      "webhookId": "e05255f6-4de4-4d02-82f2-ad0940593dbd"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Handle different webhook data formats\nlet body = $json;\n\n// If data is nested in body property, extract it\nif (body.body && typeof body.body === 'object') {\n  body = body.body;\n}\n\n// If data is nested in data property, extract it\nif (body.data && typeof body.data === 'object') {\n  body = body.data;\n}\n\n// Debug: log what we received\nconsole.log('Parse Input - Received data:', JSON.stringify(body, null, 2));\n\n// Validate message field\nif (!body.message || typeof body.message !== 'string') {\n  console.error('Parse Input - Missing message field. Received:', Object.keys(body));\n  throw new Error('Missing required field: message. Received keys: ' + Object.keys(body).join(', '));\n}\n\nreturn [{\n  json: {\n    message: body.message,\n    userId: body.userId || null,\n    userLoginId: body.userLoginId || null,\n    userFullName: body.userFullName || null,\n    userRoles: body.userRoles || [],\n    userTeams: body.userTeams || [],\n    ticketId: body.ticketId || null,\n    cookies: body.cookies || '',\n    sessionId: body.sessionId || null,\n    conversationHistory: body.conversationHistory || [],\n    timestamp: body.timestamp || new Date().toISOString()\n  }\n}];"
+      },
+      "id": "54bcede9-1e73-422b-802d-ffe39eb99aae",
+      "name": "Parse Input",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        -848,
+        64
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const input = $json;\nconst message = input.message || '';\n\n// Access API key safely from n8n environment variables\nconst geminiApiKey = $env.GEMINI_API_KEY || 'AIzaSyA3WhZccRbgM4u42ZuocTRQ21eXcJXCUZA'; \n\nif (!geminiApiKey) {\n  throw new Error('GEMINI_API_KEY environment variable is not set. Please go to n8n Settings → Environment Variables and add GEMINI_API_KEY with your API key from https://aistudio.google.com/app/apikey');\n}\n\nconst prompt = `You are a question complexity analyzer for an AI assistant system in Ivanti Service Manager. \n\nYou are a helpful, friendly IT support assistant for Ivanti Service Manager.\n\nYOUR RULES:\n1. Answer the user's question directly and simply.\n2. DO NOT use technical jargon.\n3. DO NOT explain your instructions (never say \"I will keep this under 50 words\").\n4. DO NOT mention you are an AI or a bot unless asked.\n5. Keep your answer short (under 50 words) but sound natural.\n\nEXAMPLE:\nUser: \"hi\"\nYou: \"Hello! How can I help you with your IT ticket today?\"\n\nUser: \"status of ticket 123\"\nYou: \"Ticket 123 is currently open and assigned to the Network Team.\"\n\nIMPORTANT: Just give the answer. Do not add notes like \"(Note: I will...)\" at the end.\n\n## CONTEXT:\nWe're building a Chrome Browser Extension that provides an AI-powered chat interface for Ivanti Service Manager users. The system uses intelligent routing:\n- SIMPLE questions → Ollama (local, fast, free AI) for quick answers\n- COMPLEX questions → Gemini (cloud AI with high reasoning) for deep analysis\n\nThe assistant has access to:\n- Current ticket information (if user is viewing a ticket)\n- User context (name, roles, teams, permissions)\n- Ivanti APIs (tickets, knowledge base, users, service requests)\n- Conversation history\n\n## SIMPLE Questions (Route to Ollama - Fast Local AI):\n\nThese are questions that can be answered quickly with direct facts or simple lookups:\n\nExamples:\n- \"What's the status of ticket INC-123?\"\n- \"Who is assigned to this ticket?\"\n- \"Show me my open tickets\"\n- \"When was this ticket created?\"\n- \"What's the priority?\"\n- \"Is this ticket resolved?\"\n- \"List all tickets assigned to John\"\n- \"What's the ticket number?\"\n- \"Who owns this ticket?\"\n\nCharacteristics:\n- Direct factual queries (status, assignment, dates, numbers)\n- Single-step lookups (one piece of information)\n- Simple list/display commands (\"show me\", \"list\", \"tell me\")\n- Yes/No questions (\"is\", \"can\", \"does\", \"has\")\n- Basic information requests (who, what, when, where)\n- Can be answered with a single API call or data point\n- No reasoning, analysis, or recommendations needed\n- No multi-step thinking required\n- No context from multiple sources needed\n\n## COMPLEX Questions (Route to Gemini - High Reasoning AI):\n\nThese questions require reasoning, analysis, recommendations, or multi-step thinking:\n\nExamples:\n- \"Why is this ticket taking so long? What should I do?\"\n- \"Based on the ticket history, what's the best approach to resolve this?\"\n- \"Create a service request for account unlock and assign it to the IT team\"\n- \"Analyze all tickets from last week and tell me the trends\"\n- \"What's causing this issue and how can I fix it?\"\n- \"Compare these two tickets and recommend which one to prioritize\"\n- \"Update ticket INC-123, change priority to High, and notify the user\"\n- \"What should I do next based on the current situation?\"\n- \"How can I prevent this issue from happening again?\"\n- \"Explain why this ticket was escalated and what actions were taken\"\n\nCharacteristics:\n- Requires reasoning or analysis (\"why\", \"how\", \"what caused\")\n- Needs recommendations or suggestions (\"what should\", \"recommend\", \"best\")\n- Multi-step thinking (\"create and assign\", \"update and notify\")\n- Context-dependent (\"based on\", \"considering\", \"according to\")\n- Problem-solving (\"how to fix\", \"how to prevent\", \"solution\")\n- Comparison or evaluation (\"compare\", \"which is better\", \"analyze\")\n- Action-oriented (\"create\", \"update\", \"assign\", \"notify\")\n- Requires information from multiple sources\n- Needs step-by-step thinking or planning\n- May require calling Ivanti APIs or performing actions\n\n## YOUR TASK:\n\nAnalyze the following user question and determine if it's SIMPLE or COMPLEX in the context of Ivanti Service Manager assistance.\n\nQuestion: \"${message}\"\n\nYou MUST respond with **ONLY** valid JSON (no markdown code blocks, no explanation outside JSON):\n\n{\n  \"complexity\": \"simple\" or \"complex\",\n  \"score\": 0.0 to 1.0,\n  \"reason\": \"brief one-sentence explanation specific to Ivanti context\"\n}\n\nWhere:\n- \"complexity\": Either \"simple\" (lowercase) or \"complex\" (lowercase)\n- \"score\": 0.0 (very simple) to 1.0 (very complex)\n- \"reason\": One clear sentence explaining why, mentioning Ivanti context if relevant\n`;\n\nconst model = 'gemini-2.5-flash';\n\nreturn [{\n  json: {\n    originalInput: input,\n    request: {\n      url: `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiApiKey}`,\n      body: {\n        contents: [{\n          parts: [{ text: prompt }]\n        }],\n        generationConfig: {\n          temperature: 0.3,\n          // *** THE CRITICAL FIX: Increased token limit to 1024 ***\n          maxOutputTokens: 1024, \n          responseMimeType: 'application/json'\n        }\n      }\n    }\n  }\n}];"
+      },
+      "id": "7939ce68-dd61-4b73-89c8-c82b42c3da1c",
+      "name": "Build Complexity Prompt",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        -624,
+        64
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "// 1. Get the raw response\nconst geminiResponse = $json;\n\n// 2. Get original input safely\nlet originalInput = null;\ntry {\n  originalInput = $items(\"Build Complexity Prompt\")[0].json.originalInput;\n} catch (e) {\n  // Ignore if input not found\n}\n\nlet textResponse = '';\nlet analysis = {};\n\ntry {\n  // 3. Extract text\n  if (geminiResponse.candidates && geminiResponse.candidates[0].content.parts[0].text) {\n    textResponse = geminiResponse.candidates[0].content.parts[0].text;\n\n    // 4. SMART EXTRACT: Find the first '{' and the last '}'\n    // This ignores \"Here is the json\" at the start or \"Hope this helps\" at the end.\n    const firstBracket = textResponse.indexOf('{');\n    const lastBracket = textResponse.lastIndexOf('}');\n\n    if (firstBracket !== -1 && lastBracket !== -1) {\n      const jsonString = textResponse.substring(firstBracket, lastBracket + 1);\n      analysis = JSON.parse(jsonString);\n    } else {\n      throw new Error(\"No JSON object found in response\");\n    }\n\n  } else {\n    throw new Error(\"Gemini response was empty\");\n  }\n\n} catch (error) {\n  return {\n    json: {\n      error: error.message,\n      raw_output: textResponse,\n      originalInput: originalInput\n    }\n  };\n}\n\n// 5. Return clean data\nreturn {\n  json: {\n    ...analysis,\n    originalInput: originalInput\n  }\n};"
+      },
+      "id": "9c5611c1-2322-4124-92ea-05f7a242ce53",
+      "name": "Parse Complexity Result",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        -112,
+        64
+      ]
+    },
+    {
+      "parameters": {
+        "dataType": "string",
+        "value1": "={{ $json.complexity }}",
+        "rules": {
+          "rules": [
+            {
+              "value2": "=simple"
+            },
+            {
+              "value2": "complex",
+              "output": 1
+            }
+          ]
+        }
+      },
+      "id": "eb358d46-dbb3-490a-a906-dd56024b5195",
+      "name": "Route by Complexity",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 1,
+      "position": [
+        128,
+        64
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Get the input from the previous node (Ollama)\nconst input = $input.first().json;\n\n// FIX: Look for 'content' (which is what Ollama outputs), not 'response' or 'text'\nconst message = input.content || input.response || \"No response from Ollama\";\n\nreturn {\n  message: message,\n  actions: [],         // Simple queries usually don't need JSON actions\n  thinkingSteps: [],   // Ollama doesn't provide thinking steps in this mode\n  route: \"simple\",\n  complexity: \"simple\"\n};"
+      },
+      "id": "5987abaa-a4fd-45a0-acc6-73c43d407aa2",
+      "name": "Format Simple Response",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        800,
+        -64
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const input = $json;\n\n// In a full setup, you would:\n// - Query Redis Vector Store here\n// - Optionally prefetch Ivanti ticket data via HTTP Request\n// For now, we just pass context to Gemini and let tools be configured in the agent node.\n\nconst systemPrompt = `You are an expert Ivanti Service Manager assistant.\n\nRules:\n1. ALWAYS search the Knowledge Base (Redis) first for similar past issues when the tools provide KB results.\n2. If no solution is found, use the Ivanti API tools (e.g., get_ticket) to check ticket status or details.\n3. Adapt your answer based on the user's role and teams.\n4. If you solve a problem that is not yet in the KB, suggest adding it as a new KB entry.\n\nYou must avoid hallucinations and clearly state when something is unknown.`;\n\nconst history = (input.conversationHistory || []).slice(-8).map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\\n');\n\nconst userContext = `User: ${input.userFullName || 'Unknown'} (Login: ${input.userLoginId || 'Unknown'})\\nRoles: ${(input.userRoles || []).join(', ') || 'None'}\\nTeams: ${(input.userTeams || []).join(', ') || 'None'}\\nTicketId: ${input.ticketId || 'None'}`;\n\nconst finalPrompt = `${systemPrompt}\\n\\n${userContext}\\n\\nRecent conversation:\\n${history}\\n\\nCurrent question: ${input.message}\\n\\nWhen tools are available, use them to retrieve KB entries or ticket details before answering.`;\n\nreturn [{ json: { ...input, agentPrompt: finalPrompt } }];"
+      },
+      "id": "eb2e6559-ad5e-477b-8fb2-dea6028fde2b",
+      "name": "Build Complex Agent Prompt",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        384,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const raw = $json;\nconst text = (raw.output_text || raw.text || '').trim();\n\n// Optionally, parse for tool-suggested actions in future.\n\nreturn [{\n  json: {\n    message: text || 'No response from Gemini agent',\n    actions: [],\n    thinkingSteps: [],\n    route: 'complex',\n    complexity: 'complex'\n  }\n}];"
+      },
+      "id": "62a3021a-f3a5-4306-b99c-bbad617b4c2d",
+      "name": "Format Complex Response",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        880,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "mergeByIndex"
+      },
+      "id": "3517e0d8-3465-417d-a682-3cae985cb99e",
+      "name": "Merge Any Route",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 1,
+      "position": [
+        1136,
+        64
+      ]
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "bdaadc10-5f8e-4f33-aa16-097832300777",
+      "name": "Respond to Extension",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1376,
+        64
+      ]
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3,
+      "position": [
+        576,
+        176
+      ],
+      "id": "f4bf66dd-5c3b-4eb0-8b0a-a8edddd80001",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "llama3:latest",
+          "mode": "list",
+          "cachedResultName": "llama3:latest"
+        },
+        "messages": {
+          "values": [
+            {
+             "content": "### INSTRUCTIONS ###\nYou are a helpful and concise Ivanti Service Manager assistant.\nYour goal is to answer simple questions directly and briefly (under 50 words).\n\nYou ALWAYS answer using only the TICKET DATA JSON provided below. That JSON may contain fields such as:\n- IncidentNumber\n- Subject\n- Status\n- Priority\n- CreatedDateTime\n- LastModDateTime\n- Owner / OwnerTeam\n- ProfileFullName (requester)\n- Description / Symptom\n- Resolution\n\nExamples of questions you MUST answer from this JSON:\n- \"What is the status of ticket INC-123?\" → use Status\n- \"When was this ticket created?\" → use CreatedDateTime\n- \"Who owns this ticket?\" → use Owner / OwnerTeam\n- \"What is the description?\" → use Description or Symptom\n- \"Show me my open tickets\" → list IncidentNumber, Status, and Subject for each.\n\nIf the TICKET DATA is empty, say you couldn't find any matching tickets.\n\n### CONTEXT ###\nUser Name: {{ $json.originalInput.userFullName }}\n\n### TICKET DATA (Live from Ivanti) ###\n{{ JSON.stringify($json.value) }}\n\n### QUESTION ###\n{{ $json.originalInput.message }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.ollama",
+      "typeVersion": 1,
+      "position": [
+        512,
+        -64
+      ],
+      "id": "4098c590-2d8b-437a-91f3-db8185ac18f0",
+      "name": "Message a model",
+      "credentials": {
+        "ollamaApi": {
+          "id": "bQEKIlwhUYs7kwSw",
+          "name": "Ollama account 4"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        448,
+        416
+      ],
+      "id": "2f0f842c-6abc-4448-996e-20bc3bd18941",
+      "name": "Google Gemini Chat Model",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "kTw3XamM72FSF12V",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.memoryRedisChat",
+      "typeVersion": 1.5,
+      "position": [
+        656,
+        432
+      ],
+      "id": "9a2cb3c3-d2cb-43ee-b705-3cb2152f9f56",
+      "name": "Redis Chat Memory",
+      "credentials": {
+        "redis": {
+          "id": "euIZBYsJIsI5BeFI",
+          "name": "Redis account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "toolDescription": "Call this tool to get Ivanti INCIDENT data from https://success.serviceitplus.com/HEAT/api/odata/businessobject/incidents.\n\nYou MUST supply a valid OData $filter string in the \"filter\" argument. Use ONLY these patterns (do not invent your own):\n\n1) By IncidentNumber (exact ticket number)\n   - Example: IncidentNumber eq 'INC-12345'\n   - Use when the user says: \"status of ticket INC-12345\" or \"open INC-12345\".\n\n2) By RecId (internal Ivanti RecId)\n   - Example: RecId eq '1234567890ABCD'\n   - Use when you already know the RecId from a previous tool call.\n\n3) My open tickets (like getUserTickets in the Chrome extension)\n   - Example: OwnerEmail eq '<userEmail>' and Status ne 'Closed'\n   - Use when the user says: \"show me my open tickets\".\n\n4) By status\n   - Example: Status eq 'Open'\n   - Or: Status eq 'Resolved'\n\n5) By keyword in Subject (case-insensitive)\n   - Example: contains(tolower(Subject),'vpn')\n   - Use when the user asks: \"tickets about vpn\" or \"incidents with email issue\".\n\n6) By date range on CreatedDateTime\n   - Example: CreatedDateTime ge DateTime'2025-12-01T00:00:00Z' and CreatedDateTime lt DateTime'2025-12-02T00:00:00Z'\n   - Use when the user says: \"tickets created on December 1, 2025\".\n\nRULES:\n- ALWAYS return the smallest filter that answers the question.\n- NEVER use * or wildcards; always use the exact field names above.\n- If the user does not give enough info to build a valid filter from this list, FIRST ask a clarification question instead of guessing.\n- When you need this tool, you MUST provide a single string argument named \"filter\" using one of the patterns above.",
+        "url": "https://success.serviceitplus.com/HEAT/api/odata/businessobject/incidents",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "$filter",
+              "value": "={{$fromAI(\"filter\", \"The OData filter string, e.g. IncidentNumber eq 'INC-12345' or OwnerEmail eq '<email>' and Status ne 'Closed'\")}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequestTool",
+      "typeVersion": 4.3,
+      "position": [
+        848,
+        432
+      ],
+      "id": "b7137679-cbd9-45d3-8158-fee7668b73b3",
+      "name": "get_ivanti_data",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "A8tNUmwBu8vhJ4qD",
+          "name": "Header Auth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+  "url": "https://success.serviceitplus.com/HEAT/api/odata/businessobject/incidents",
+  "sendQuery": true,
+  "queryParameters": {
+    "parameters": [
+      {
+        "name": "$filter",
+        "value": "={{ $json.originalInput.ticketId ? `IncidentNumber eq '${$json.originalInput.ticketId}'` : `OwnerEmail eq '${$json.originalInput.userLoginId}' and Status ne 'Closed'` }}"
+      },
+      {
+        "name": "$top",
+        "value": "5"
+      }
+    ]
+  },
+  "sendHeaders": true,
+  "headerParameters": {
+    "parameters": [
+      {
+        "name": "Authorization",
+        "value": "rest_api_key=78D033FDB3D14F0FB4C66261B4FAA3AF"
+      }
+    ]
+  },
+  "options": {}
+},
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        336,
+        -64
+      ],
+      "id": "e7844104-5e9e-4751-a255-66386679d2f8",
+      "name": "Get Data"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook - Ivanti AI": {
+      "main": [
+        [
+          {
+            "node": "Parse Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Input": {
+      "main": [
+        [
+          {
+            "node": "Build Complexity Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Complexity Prompt": {
+      "main": [
+        [
+          {
+            "node": "Call Gemini (Complexity)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Gemini (Complexity)": {
+      "main": [
+        [
+          {
+            "node": "Parse Complexity Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Complexity Result": {
+      "main": [
+        [
+          {
+            "node": "Route by Complexity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Complexity": {
+      "main": [
+        [
+          {
+            "node": "Get Data",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Complex Agent Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Complex Agent Prompt": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Simple Response": {
+      "main": [
+        [
+          {
+            "node": "Merge Any Route",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Complex Response": {
+      "main": [
+        [
+          {
+            "node": "Merge Any Route",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Any Route": {
+      "main": [
+        [
+          {
+            "node": "Respond to Extension",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Format Complex Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Message a model": {
+      "main": [
+        [
+          {
+            "node": "Format Simple Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Redis Chat Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_ivanti_data": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Data": {
+      "main": [
+        [
+          {
+            "node": "Message a model",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "4262952f-59a4-46c3-8776-59f819988cf7",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "d01a6a8c11890acdbdc9cdddc68985eaa48ca0323d040fb817e6a87a3e72b287"
+  },
+  "id": "bU3T50yxuH9EoI4F",
+  "tags": []
+}

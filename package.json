@@ -6,7 +6,11 @@
   "scripts": {
     "dev": "vite build --watch --mode development",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "check-licenses": "npx license-checker --summary",
+    "export-licenses": "npx license-checker --json > licenses/licenses.json && npx license-checker --csv > licenses/licenses.csv",
+    "verify-licenses": "npx license-checker --onlyAllow 'MIT;ISC;Apache-2.0;BSD-3-Clause;MPL-2.0;CC-BY-4.0' || echo '⚠️  Some packages have non-standard licenses. Review manually.'",
+    "generate-licenses": "bash scripts/generate-licenses.sh"
   },
   "dependencies": {
     "driver.js": "^1.4.0",
@@ -23,6 +27,7 @@
     "@types/react-dom": "^18.2.17",
     "@vitejs/plugin-react": "^4.2.1",
     "autoprefixer": "^10.4.16",
+    "license-checker": "^25.0.1",
     "postcss": "^8.4.32",
     "tailwindcss": "^3.3.6",
     "typescript": "^5.3.3",

@@ -23,6 +23,8 @@ interface Message {
   role: 'user' | 'assistant';
   content: string;
   timestamp: Date;
+  // Optional structured payload for rich cards/actions
+  metadata?: any;
 }
 
 // Serializable version of Message for storage (Date becomes ISO string)
@@ -177,7 +179,7 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
   const [widgetWidth, setWidgetWidth] = useState(384); // Default: 384px (w-96)
   // Default to Flash Lite for highest quota (best for free tier)
   const [selectedModel, setSelectedModel] = useState('gemini-2.5-flash-lite');
-  const [aiProvider, setAiProvider] = useState<'gemini' | 'ollama'>('gemini');
+  const [aiProvider, setAiProvider] = useState<'gemini' | 'ollama' | 'grok'>('gemini');
   const [isModelDropdownOpen, setIsModelDropdownOpen] = useState(false);
   const modelDropdownRef = useRef<HTMLDivElement>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -186,6 +188,153 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
   const [theme, setTheme] = useState<Theme>(DEFAULT_THEME);
   const [isThemeEditorOpen, setIsThemeEditorOpen] = useState(false);
   const [tempTheme, setTempTheme] = useState<Theme>(DEFAULT_THEME); // Temporary theme for editing
+
+  // Pending Service Request confirmation state
+  const [pendingServiceRequest, setPendingServiceRequest] = useState<{
+    subscriptionId: string;
+    offeringName: string;
+    fields: Array<{
+      name: string;
+      label: string;
+      required: boolean;
+      value?: string;
+      options?: Array<{ value: string; label: string }>;
+    }>;
+    error?: string;
+    missingFields?: Array<{ name: string; label: string }>;
+    readyForConfirmation?: boolean; // ✅ Whether all required fields are filled
+  } | null>(null);
+
+  const handleUpdatePendingField = (fieldName: string, value: string) => {
+    setPendingServiceRequest(prev => {
+      if (!prev) return prev;
+      
+      // Update the field value
+      const updatedFields = prev.fields.map(f =>
+        f.name === fieldName ? { ...f, value } : f
+      );
+      
+      // Check if all required fields are now filled
+      const requiredFields = updatedFields.filter(f => f.required);
+      const filledRequiredFields = requiredFields.filter(f => 
+        f.value !== undefined && f.value !== null && f.value !== '' && String(f.value).trim() !== ''
+      );
+      const allRequiredFilled = requiredFields.length === 0 || filledRequiredFields.length === requiredFields.length;
+      
+      // Find still-missing required fields
+      const stillMissing = requiredFields.filter(f => 
+        !f.value || String(f.value).trim() === ''
+      ).map(f => ({ name: f.name, label: f.label }));
+      
+      return {
+        ...prev,
+        fields: updatedFields,
+        error: allRequiredFilled ? undefined : `Please fill in ${stillMissing.length} required field${stillMissing.length > 1 ? 's' : ''}: ${stillMissing.map(mf => mf.label).join(', ')}`,
+        missingFields: allRequiredFilled ? undefined : stillMissing,
+        readyForConfirmation: allRequiredFilled, // ✅ Update readiness status
+      };
+    });
+  };
+
+  const handleCancelPendingServiceRequest = () => {
+    setPendingServiceRequest(null);
+  };
+
+  const handleConfirmPendingServiceRequest = async () => {
+    if (!pendingServiceRequest) return;
+    
+    // ✅ Prevent submission if required fields are missing
+    if (pendingServiceRequest.readyForConfirmation === false) {
+      const missingList = pendingServiceRequest.missingFields?.map(mf => mf.label).join(', ') || 'required fields';
+      setPendingServiceRequest(prev => prev ? {
+        ...prev,
+        error: `Cannot submit: Please fill in all required fields: ${missingList}`
+      } : prev);
+      return;
+    }
+
+    console.log('[ChatWidget] 🚀 Confirming service request with fields:', pendingServiceRequest.fields);
+    console.log('[ChatWidget] 🚀 Fields count:', pendingServiceRequest.fields.length);
+
+    const fieldValues: Record<string, any> = {};
+    pendingServiceRequest.fields.forEach(f => {
+      console.log(`[ChatWidget]   Field: ${f.name} = ${f.value}`);
+      fieldValues[f.name] = f.value ?? '';
+    });
+
+    console.log('[ChatWidget] 🚀 Final fieldValues:', fieldValues);
+    console.log('[ChatWidget] 🚀 FieldValues keys:', Object.keys(fieldValues));
+
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: 'CONFIRM_SERVICE_REQUEST',
+        subscriptionId: pendingServiceRequest.subscriptionId,
+        fieldValues,
+      });
+
+      if (!response || !response.success) {
+        const errorMessage = response?.error || 'Failed to create service request';
+        const missingFields = response?.missingFields || [];
+        
+        // Show error in the form
+        setPendingServiceRequest(prev =>
+          prev
+            ? {
+                ...prev,
+                error: errorMessage,
+                missingFields: missingFields,
+              }
+            : prev
+        );
+        
+        // ✅ Automatically send AI message explaining what's missing
+        if (response?.validationError && missingFields.length > 0) {
+          const aiExplanation: Message = {
+            id: (Date.now() + 1).toString(),
+            role: 'assistant',
+            content: `⚠️ **Cannot submit yet** - ${missingFields.length} required field${missingFields.length > 1 ? 's are' : ' is'} missing:\n\n${missingFields.map((f: any, i: number) => {
+              let line = `${i + 1}. ${f.label || f.name}`;
+              if (f.options && f.options.length > 0) {
+                const opts = f.options.slice(0, 5).map((o: any) => o.label);
+                line += ` (options: ${opts.join(', ')}${f.options.length > 5 ? `, +${f.options.length - 5} more` : ''})`;
+              }
+              return line;
+            }).join('\n')}\n\nPlease fill in these fields in the form above, then try submitting again.`,
+            timestamp: new Date(),
+          };
+          
+          setMessages(prev => [...prev, aiExplanation]);
+          
+          // Scroll to show the error message
+          setTimeout(() => {
+            messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+          }, 100);
+        }
+        
+        return;
+      }
+
+      // Show success message in chat
+      const successMessage: Message = {
+        id: (Date.now() + 2).toString(),
+        role: 'assistant',
+        content: `✅ Service request ${response.requestNumber || ''} was created for "${response.offeringName || 'the selected request'}".`,
+        timestamp: new Date(),
+      };
+      setMessages(prev => [...prev, successMessage]);
+      setPendingServiceRequest(null);
+    } catch (error: any) {
+      console.error('Error confirming service request:', error);
+      setPendingServiceRequest(prev =>
+        prev
+          ? {
+              ...prev,
+              error: error?.message || 'Error confirming service request',
+            }
+          : prev
+      );
+    }
+  };
 
   // Available Gemini models
   const geminiModels = [
@@ -197,18 +346,27 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
     { value: 'gemini-1.5-pro', label: 'Gemini 1.5 Pro', description: 'Previous generation Pro' },
   ];
 
-  // Available Ollama models
+  // Available Ollama models (matching what you have installed)
   const ollamaModels = [
-    { value: 'llama3.2', label: 'Llama 3.2', description: 'Latest Llama 3.2 (recommended)' },
+    { value: 'llama3:latest', label: 'Llama 3 (Latest)', description: 'Latest Llama 3 - Recommended' },
+    { value: 'llama3.2', label: 'Llama 3.2', description: 'Llama 3.2' },
     { value: 'llama3.1', label: 'Llama 3.1', description: 'Llama 3.1' },
-    { value: 'llama3', label: 'Llama 3', description: 'Llama 3' },
+    { value: 'llama3', label: 'Llama 3', description: 'Llama 3 (base)' },
+    { value: 'mistral:latest', label: 'Mistral (Latest)', description: 'Latest Mistral model' },
     { value: 'mistral', label: 'Mistral', description: 'Mistral 7B' },
     { value: 'qwen2.5', label: 'Qwen 2.5', description: 'Qwen 2.5' },
     { value: 'phi3', label: 'Phi-3', description: 'Phi-3' },
   ];
 
-  // Get available models based on provider
-  const availableModels = aiProvider === 'ollama' ? ollamaModels : geminiModels;
+  // Available xAI Grok models
+  const grokModels = [
+    { value: 'grok-beta', label: 'Grok Beta', description: 'Latest Grok model - FREE ⚡' },
+    { value: 'grok-2', label: 'Grok 2', description: 'Grok 2 (stable)' },
+    { value: 'grok-vision-beta', label: 'Grok Vision Beta', description: 'Grok with vision capabilities' },
+  ];
+
+  // Models are shown in separate sections in the dropdown
+  // The provider is auto-detected when a model is selected
  
   // Load theme from storage on mount
   useEffect(() => {
@@ -241,14 +399,17 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
     // Get provider from storage or default to gemini
     chrome.storage.local.get(['aiProvider', 'aiAssistantHidden', 'chatWidgetWidth', 'selectedAIModel'], (result) => {
       // Determine provider: check storage first, then infer from model, then default to gemini
-      let provider: 'gemini' | 'ollama' = 'gemini';
+      let provider: 'gemini' | 'ollama' | 'grok' = 'gemini';
       
       if (result.aiProvider) {
-        provider = (result.aiProvider.toLowerCase() as 'gemini' | 'ollama') || 'gemini';
+        provider = (result.aiProvider.toLowerCase() as 'gemini' | 'ollama' | 'grok') || 'gemini';
       } else if (result.selectedAIModel) {
         // Infer provider from model name if provider not set
-        const ollamaModels = ['llama3.2', 'llama3.1', 'llama3', 'mistral', 'qwen2.5', 'phi3'];
-        if (ollamaModels.includes(result.selectedAIModel)) {
+        const grokModelPatterns = ['grok'];
+        const ollamaModelPatterns = ['llama3', 'mistral', 'qwen', 'phi3'];
+        if (grokModelPatterns.some(pattern => result.selectedAIModel.includes(pattern))) {
+          provider = 'grok';
+        } else if (ollamaModelPatterns.some(pattern => result.selectedAIModel.includes(pattern))) {
           provider = 'ollama';
         }
       }
@@ -268,18 +429,25 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
         'gemini-2.5-pro', 'gemini-1.5-flash', 'gemini-1.5-pro'
       ];
       const validOllamaModels = [
-        'llama3.2', 'llama3.1', 'llama3', 'mistral', 'qwen2.5', 'phi3'
+        'llama3:latest', 'llama3.2', 'llama3.1', 'llama3', 
+        'mistral:latest', 'mistral', 'qwen2.5', 'phi3'
       ];
       
       if (result.selectedAIModel) {
         if (provider === 'ollama') {
-          // Ollama models
-          if (validOllamaModels.includes(result.selectedAIModel)) {
-            setSelectedModel(result.selectedAIModel);
+          // Ollama models - also check if model name matches (without :latest suffix)
+          const modelMatches = validOllamaModels.includes(result.selectedAIModel) ||
+            validOllamaModels.some(m => m.replace(':latest', '') === result.selectedAIModel.replace(':latest', ''));
+          
+          if (modelMatches) {
+            // Use the stored model, or find the :latest version if available
+            const storedModel = result.selectedAIModel;
+            const latestVersion = validOllamaModels.find(m => m === storedModel || m.replace(':latest', '') === storedModel.replace(':latest', ''));
+            setSelectedModel(latestVersion || storedModel);
           } else {
-            // Invalid or Gemini model - default to llama3.2
-            setSelectedModel('llama3.2');
-            chrome.storage.local.set({ selectedAIModel: 'llama3.2' });
+            // Invalid or Gemini model - default to llama3:latest
+            setSelectedModel('llama3:latest');
+            chrome.storage.local.set({ selectedAIModel: 'llama3:latest' });
           }
         } else {
           // Gemini models
@@ -307,7 +475,7 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
         }
       } else {
         // No stored preference - set default based on provider
-        const defaultModel = provider === 'ollama' ? 'llama3.2' : 'gemini-2.5-flash-lite';
+        const defaultModel = provider === 'ollama' ? 'llama3:latest' : 'gemini-2.5-flash-lite';
         setSelectedModel(defaultModel);
         chrome.storage.local.set({ selectedAIModel: defaultModel });
       }
@@ -663,15 +831,71 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
       };
 
       setMessages(prev => [...prev, assistantMessage]);
-      
+
+      // ✅ If agent provided thinking steps, show them
+      if (response.thinkingSteps && response.thinkingSteps.length > 0) {
+        console.log('[ChatWidget] 🤖 Agent provided thinking steps:', response.thinkingSteps);
+        // Convert agent steps to the format expected by UI
+        const agentStepObjects = response.thinkingSteps.map((step: any) => ({
+          text: step.label,
+          status: step.status, // pending, in_progress, completed, error
+          detail: step.detail,
+          error: step.error
+        }));
+        setThinkingStepObjects(agentStepObjects);
+      }
+
       // Scroll to bottom after adding assistant message
       setTimeout(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
       }, 100);
 
-      // TODO: Handle any actions returned by AI
+      // Handle any actions returned by AI (e.g., service request drafts)
       if (response.actions && response.actions.length > 0) {
         console.log('AI suggested actions:', response.actions);
+
+        const srDraft = response.actions.find(
+          (a: any) =>
+            a.endpoint === 'ivanti://serviceRequest/draft' &&
+            a.body &&
+            a.body.subscriptionId &&
+            a.body.fieldset &&
+            Array.isArray(a.body.fieldset.fields)
+        );
+
+        if (srDraft) {
+          const { subscriptionId, offeringName, fieldset, readyForConfirmation, missingRequiredFields } = srDraft.body;
+          
+          // ✅ ALWAYS show the form, even with missing fields
+          // This allows users to see what's needed and fill in missing fields
+          // Submit button will be disabled until all required fields are filled
+          console.log('[ChatWidget] 📋 Creating fields from fieldset:', fieldset);
+          console.log('[ChatWidget] 📋 Fieldset.fields:', fieldset.fields);
+          console.log('[ChatWidget] ⚠️ Ready for confirmation:', readyForConfirmation);
+          console.log('[ChatWidget] ⚠️ Missing required fields:', missingRequiredFields);
+          
+          const fields = fieldset.fields.map((f: any) => ({
+            name: f.name,
+            label: f.label,
+            required: !!f.required,
+            value: f.defaultValue ?? '',
+            options: f.options || undefined,
+          }));
+
+          console.log('[ChatWidget] 📋 Mapped fields with values:', fields);
+          console.log('[ChatWidget] 📋 Fields count:', fields.length);
+
+          setPendingServiceRequest({
+            subscriptionId,
+            offeringName: offeringName || fieldset.name || 'Service Request',
+            fields,
+            error: readyForConfirmation === false && missingRequiredFields?.length 
+              ? `Please fill in ${missingRequiredFields.length} required field${missingRequiredFields.length > 1 ? 's' : ''} before submitting: ${missingRequiredFields.map((mf: any) => mf.label || mf.name).join(', ')}`
+              : undefined,
+            missingFields: missingRequiredFields || undefined,
+            readyForConfirmation: readyForConfirmation !== false, // Store this to disable submit button
+          });
+        }
       }
 
     } catch (error: any) {
@@ -1248,6 +1472,172 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
                 </div>
               ))}
 
+              {/* Pending Service Request confirmation card */}
+              {pendingServiceRequest && (
+                <div className="sit-flex sit-flex-col sit-gap-2 sit-fade-in-up" style={{ alignItems: 'flex-start' }}>
+                  <div
+                    className="sit-rounded-2xl sit-border sit-border-slate-200 sit-bg-white"
+                    style={{
+                      boxShadow: '0 4px 12px rgba(0, 0, 0, 0.06)',
+                      padding: '16px 18px',
+                      maxWidth: '85%',
+                      width: '100%',
+                    }}
+                  >
+                    <div className="sit-flex sit-flex-col sit-gap-2">
+                      <div className="sit-text-sm sit-font-semibold sit-text-slate-800">
+                        Review Service Request
+                      </div>
+                      <div className="sit-text-xs sit-text-slate-500 sit-mb-1">
+                        {pendingServiceRequest.offeringName}
+                      </div>
+
+                      {pendingServiceRequest.error && (
+                        <div className="sit-bg-red-50 sit-border sit-border-red-200 sit-rounded-md sit-p-2 sit-mb-2">
+                          <div className="sit-flex sit-items-start sit-gap-2">
+                            <span className="sit-text-red-600 sit-font-bold">⚠️</span>
+                            <div className="sit-flex-1">
+                              <div className="sit-text-xs sit-font-semibold sit-text-red-800 sit-mb-1">
+                                Cannot Submit - Missing Required Fields
+                              </div>
+                              <br />
+                              <div className="sit-text-xs sit-text-red-700">
+                                {pendingServiceRequest.error}
+                              </div>
+                              <br />
+                              {pendingServiceRequest.missingFields && pendingServiceRequest.missingFields.length > 0 && (
+                                <div className="sit-mt-2 sit-text-xs sit-text-red-600">
+                                  <strong>Missing fields:</strong>{' '}
+                                  {pendingServiceRequest.missingFields.map((mf: any) => mf.label || mf.name).join(', ')}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="sit-flex sit-flex-col sit-gap-2 sit-mt-1">
+                        {pendingServiceRequest.fields.map((field) => {
+                          const isMissing =
+                            pendingServiceRequest.missingFields &&
+                            pendingServiceRequest.missingFields.some((mf) => mf.name === field.name);
+
+                          return (
+                            <div key={field.name} className="sit-flex sit-flex-col sit-gap-1">
+                              <label className="sit-text-xs sit-font-medium sit-text-slate-700">
+                                {field.label}
+                                {field.required && <span className="sit-text-red-500"> *</span>}
+                              </label>
+                              {field.options && field.options.length > 0 ? (
+                                <>
+                                  <select
+                                    className={`sit-text-xs sit-rounded-md sit-border sit-px-2 sit-py-1 focus:sit-outline-none focus:sit-ring-2 ${
+                                      isMissing
+                                        ? 'sit-border-red-400 sit-bg-red-50 focus:sit-ring-red-500'
+                                        : 'sit-border-slate-300 focus:sit-ring-sit-primary-500'
+                                    }`}
+                                    value={field.value || ''}
+                                    onChange={(e) => handleUpdatePendingField(field.name, e.target.value)}
+                                  >
+                                    <option value="">Select an option...</option>
+                                    {field.options.map((opt) => (
+                                      <option key={opt.value} value={opt.value}>
+                                        {opt.label}
+                                      </option>
+                                    ))}
+                                  </select>
+                                  {/* ✅ Show available options as help text */}
+                                  {field.options.length <= 10 && (
+                                    <div className="sit-text-[10px] sit-text-slate-500 sit-mt-0.5">
+                                      💡 Available: {field.options.slice(0, 8).map(opt => opt.label).join(', ')}
+                                      {field.options.length > 8 && ` (+${field.options.length - 8} more)`}
+                                    </div>
+                                  )}
+                                  {field.options.length > 10 && (
+                                    <div className="sit-text-[10px] sit-text-slate-500 sit-mt-0.5">
+                                      💡 {field.options.length} options available - select from dropdown above
+                                    </div>
+                                  )}
+                                </>
+                              ) : (
+                                <input
+                                  className={`sit-text-xs sit-rounded-md sit-border sit-px-2 sit-py-1 focus:sit-outline-none focus:sit-ring-2 ${
+                                    isMissing
+                                      ? 'sit-border-red-400 sit-bg-red-50 focus:sit-ring-red-500'
+                                      : 'sit-border-slate-300 focus:sit-ring-sit-primary-500'
+                                  }`}
+                                  type="text"
+                                  value={field.value || ''}
+                                  onChange={(e) => handleUpdatePendingField(field.name, e.target.value)}
+                                  placeholder={field.required ? 'Enter required information...' : 'Optional - enter if needed'}
+                                />
+                              )}
+                              {/* ✅ Enhanced error message with guidance */}
+                              {isMissing && (
+                                <div className="sit-text-[11px] sit-text-red-600 sit-font-medium sit-flex sit-items-start sit-gap-1 sit-mt-0.5">
+                                  <span>⚠️</span>
+                                  <div className="sit-flex-1">
+                                    <div>This field is required and cannot be empty.</div>
+                                    {field.options && field.options.length > 0 && (
+                                      <div className="sit-mt-1 sit-text-[10px] sit-text-red-500">
+                                        Please select from: {field.options.slice(0, 5).map(opt => opt.label).join(', ')}
+                                        {field.options.length > 5 && ` or ${field.options.length - 5} more options`}
+                                      </div>
+                                    )}
+                                    {!field.options && (
+                                      <div className="sit-mt-1 sit-text-[10px] sit-text-red-500">
+                                        {field.label.toLowerCase().includes('email') && 'Enter a valid email address'}
+                                        {field.label.toLowerCase().includes('name') && 'Enter the person\'s full name'}
+                                        {field.label.toLowerCase().includes('location') && 'Enter the location (e.g., "Manila Office", "Remote")'}
+                                        {field.label.toLowerCase().includes('manager') && 'Enter the manager\'s name'}
+                                        {!field.label.toLowerCase().includes('email') && !field.label.toLowerCase().includes('name') && !field.label.toLowerCase().includes('location') && !field.label.toLowerCase().includes('manager') && 'Enter the required information'}
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      <div className="sit-flex sit-justify-end sit-gap-2 sit-mt-3">
+                        <button
+                          type="button"
+                          className="sit-text-xs sit-font-medium sit-text-slate-500 sit-px-3 sit-py-1.5 sit-rounded-md hover:sit-bg-slate-100"
+                          onClick={handleCancelPendingServiceRequest}
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          className="sit-text-xs sit-font-medium sit-px-3 sit-py-1.5 sit-rounded-md"
+                          style={{
+                            backgroundColor: pendingServiceRequest.readyForConfirmation !== false 
+                              ? theme.colors.primary 
+                              : '#9ca3af',
+                            color: 'white',
+                            cursor: pendingServiceRequest.readyForConfirmation !== false 
+                              ? 'pointer' 
+                              : 'not-allowed',
+                            opacity: pendingServiceRequest.readyForConfirmation !== false ? 1 : 0.6
+                          }}
+                          onClick={handleConfirmPendingServiceRequest}
+                          disabled={pendingServiceRequest.readyForConfirmation === false}
+                          title={pendingServiceRequest.readyForConfirmation === false 
+                            ? `Please fill in all required fields: ${pendingServiceRequest.missingFields?.map(mf => mf.label).join(', ')}`
+                            : 'Submit this service request'}
+                        >
+                          {pendingServiceRequest.readyForConfirmation === false 
+                            ? 'Fill Required Fields First' 
+                            : 'Confirm & Submit'}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {/* Enhanced Thinking Indicator - Cursor-style minimal design (no card, clean and elegant) */}
               {isLoading && thinkingStepObjects.length > 0 && (
                 <div className="sit-flex sit-flex-col sit-gap-1 sit-fade-in-up" style={{ alignItems: 'flex-start', width: '100%', padding: '6px 0' }}>
@@ -1525,7 +1915,7 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
                     e.currentTarget.style.borderColor = theme.colors.border;
                     e.currentTarget.style.color = theme.colors.textMuted;
                   }}
-                  title={`AI Model: ${availableModels.find(m => m.value === selectedModel)?.label || selectedModel} (${aiProvider === 'ollama' ? 'Ollama' : 'Gemini'})`}
+                  title={`AI Model: ${[...geminiModels, ...ollamaModels, ...grokModels].find(m => m.value === selectedModel)?.label || selectedModel} (${aiProvider === 'grok' ? 'Grok' : aiProvider === 'ollama' ? 'Ollama' : 'Gemini'})`}
                   aria-label="Change AI model"
                 >
                   <ChevronDown size={16} strokeWidth={2.5} />
@@ -1534,17 +1924,31 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
                 {/* Dropdown Menu */}
                 {isModelDropdownOpen && (
                   <div
-                    className="sit-absolute sit-right-0 sit-mb-1 sit-rounded-lg sit-shadow-lg sit-overflow-hidden sit-z-50"
+                    className="sit-absolute sit-right-0 sit-mb-1 sit-rounded-lg sit-shadow-lg sit-overflow-hidden sit-z-50 model-dropdown-scroll"
                     style={{
                       backgroundColor: '#ffffff',
                       border: '1px solid #e5e7eb',
                       minWidth: '220px',
+                      maxHeight: '210px', // Show ~3 models (each ~70px tall)
+                      overflowY: 'auto',
+                      overflowX: 'hidden',
                       boxShadow: '0 4px 12px rgba(0, 0, 0, 0.15)',
                       bottom: '100%',
                       marginBottom: '4px',
+                      // Custom scrollbar styling (Firefox)
+                      scrollbarWidth: 'thin',
+                      scrollbarColor: '#cbd5e1 #f1f5f9',
+                    }}
+                    onScroll={(e) => {
+                      // Prevent click events from propagating when scrolling
+                      e.stopPropagation();
                     }}
                   >
-                    {availableModels.map((model) => (
+                    {/* Gemini Models Section */}
+                    <div style={{ padding: '8px 12px', fontSize: '11px', fontWeight: '600', color: '#6b7280', textTransform: 'uppercase', letterSpacing: '0.5px', borderBottom: '1px solid #e5e7eb' }}>
+                      Google Gemini
+                    </div>
+                    {geminiModels.map((model) => (
                       <button
                         key={model.value}
                         onClick={(e) => {
@@ -1553,12 +1957,111 @@ const ChatWidget: React.FC<ChatWidgetProps> = ({ currentUser }) => {
                           setIsModelDropdownOpen(false);
                           // Save model selection
                           chrome.storage.local.set({ selectedAIModel: model.value });
-                          // Also save provider if switching between providers
-                          const modelProvider = ollamaModels.some(m => m.value === model.value) ? 'ollama' : 'gemini';
-                          if (modelProvider !== aiProvider) {
-                            setAiProvider(modelProvider);
-                            chrome.storage.local.set({ aiProvider: modelProvider });
+                          // Set provider to gemini
+                          setAiProvider('gemini');
+                          chrome.storage.local.set({ aiProvider: 'gemini' });
+                        }}
+                        className="sit-w-full sit-text-left sit-px-3 sit-py-2.5 sit-cursor-pointer sit-border-0 sit-transition-colors"
+                        style={{
+                          backgroundColor: selectedModel === model.value ? '#f3f4f6' : '#ffffff',
+                          color: '#1f2937',
+                          fontSize: '13px',
+                          borderBottom: '1px solid #f3f4f6',
+                        }}
+                        onMouseEnter={(e) => {
+                          if (selectedModel !== model.value) {
+                            e.currentTarget.style.backgroundColor = '#f9fafb';
                           }
+                        }}
+                        onMouseLeave={(e) => {
+                          if (selectedModel !== model.value) {
+                            e.currentTarget.style.backgroundColor = '#ffffff';
+                          }
+                        }}
+                      >
+                        <div className="sit-flex sit-items-center sit-justify-between">
+                          <div className="sit-flex sit-flex-col">
+                            <span style={{ fontWeight: selectedModel === model.value ? '600' : '500', fontSize: '13px' }}>
+                              {model.label}
+                            </span>
+                            <span style={{ fontSize: '11px', color: '#6b7280', marginTop: '2px' }}>
+                              {model.description}
+                            </span>
+                          </div>
+                          {selectedModel === model.value && (
+                            <span style={{ color: '#002b5c', fontSize: '14px', fontWeight: '600' }}>✓</span>
+                          )}
+                        </div>
+                      </button>
+                    ))}
+                    
+                    {/* Ollama Models Section */}
+                    <div style={{ padding: '8px 12px', fontSize: '11px', fontWeight: '600', color: '#6b7280', textTransform: 'uppercase', letterSpacing: '0.5px', borderTop: '2px solid #e5e7eb', borderBottom: '1px solid #e5e7eb', marginTop: '4px' }}>
+                      Ollama (Local)
+                    </div>
+                    {ollamaModels.map((model) => (
+                      <button
+                        key={model.value}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setSelectedModel(model.value);
+                          setIsModelDropdownOpen(false);
+                          // Save model selection
+                          chrome.storage.local.set({ selectedAIModel: model.value });
+                          // Set provider to ollama
+                          setAiProvider('ollama');
+                          chrome.storage.local.set({ aiProvider: 'ollama' });
+                        }}
+                        className="sit-w-full sit-text-left sit-px-3 sit-py-2.5 sit-cursor-pointer sit-border-0 sit-transition-colors"
+                        style={{
+                          backgroundColor: selectedModel === model.value ? '#f3f4f6' : '#ffffff',
+                          color: '#1f2937',
+                          fontSize: '13px',
+                          borderBottom: '1px solid #f3f4f6',
+                        }}
+                        onMouseEnter={(e) => {
+                          if (selectedModel !== model.value) {
+                            e.currentTarget.style.backgroundColor = '#f9fafb';
+                          }
+                        }}
+                        onMouseLeave={(e) => {
+                          if (selectedModel !== model.value) {
+                            e.currentTarget.style.backgroundColor = '#ffffff';
+                          }
+                        }}
+                      >
+                        <div className="sit-flex sit-items-center sit-justify-between">
+                          <div className="sit-flex sit-flex-col">
+                            <span style={{ fontWeight: selectedModel === model.value ? '600' : '500', fontSize: '13px' }}>
+                              {model.label}
+                            </span>
+                            <span style={{ fontSize: '11px', color: '#6b7280', marginTop: '2px' }}>
+                              {model.description}
+                            </span>
+                          </div>
+                          {selectedModel === model.value && (
+                            <span style={{ color: '#002b5c', fontSize: '14px', fontWeight: '600' }}>✓</span>
+                          )}
+                        </div>
+                      </button>
+                    ))}
+                    
+                    {/* Grok Models Section */}
+                    <div style={{ padding: '8px 12px', fontSize: '11px', fontWeight: '600', color: '#6b7280', textTransform: 'uppercase', letterSpacing: '0.5px', borderTop: '2px solid #e5e7eb', borderBottom: '1px solid #e5e7eb', marginTop: '4px' }}>
+                      xAI Grok (Free)
+                    </div>
+                    {grokModels.map((model) => (
+                      <button
+                        key={model.value}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setSelectedModel(model.value);
+                          setIsModelDropdownOpen(false);
+                          // Save model selection
+                          chrome.storage.local.set({ selectedAIModel: model.value });
+                          // Set provider to grok
+                          setAiProvider('grok');
+                          chrome.storage.local.set({ aiProvider: 'grok' });
                         }}
                         className="sit-w-full sit-text-left sit-px-3 sit-py-2.5 sit-cursor-pointer sit-border-0 sit-transition-colors"
                         style={{

@@ -98,7 +98,10 @@ export const IVANTI_DOCUMENTATION: IvantiDocSection[] = [
 - Resolved: Issue has been fixed, waiting for user confirmation
 - Closed: Incident is fully resolved and closed
 - Status transitions: Logged → Active → Resolved → Closed
-- Resolution field is required when status is set to Resolved or Closed
+- Resolution field is recommended when status is set to Resolved or Closed
+- ⚠️ CRITICAL: CauseCode field is REQUIRED when status is set to "Resolved"
+- Common CauseCode values: "Fixed", "Resolved", "Completed", "No Problem Found", "User Error", "Training Provided"
+- If CauseCode is not provided when resolving, use "Fixed" as a default value
 - ClosedDateTime: Automatically set when status changes to Closed`
   },
   {
@@ -125,7 +128,10 @@ export const IVANTI_DOCUMENTATION: IvantiDocSection[] = [
     content: `REQUIRED FIELDS FOR CREATING INCIDENTS:
 - Subject: Brief title describing the issue (REQUIRED)
 - Symptom: Detailed description of the problem (REQUIRED)
-- Category: Type of issue (REQUIRED) - Must be a valid category from the system
+- Category: Type of issue (REQUIRED) - Must be a VALID category from Ivanti's validation list
+- ⚠️ CRITICAL: Category is a validated field - it MUST match exact values from the system's validation list
+- Categories are case-sensitive and must match exactly (e.g., "Service Desk" not "service desk")
+- Invalid categories will be rejected with error: "is not in the validation list"
 - Optional but recommended:
   - Priority: 1-5 (defaults to 5 if not specified)
   - Source: How it was reported (Phone, Email, Chat, Self Service)

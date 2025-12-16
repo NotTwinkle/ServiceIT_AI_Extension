@@ -38,12 +38,17 @@ const CACHE_CONFIG: CacheConfig = {
 };
 
 // TTL configurations for different data types (in milliseconds)
+// INDUSTRY BEST PRACTICE: Balance freshness vs performance
 const TTL_CONFIG = {
   employees: 15 * 60 * 1000,      // 15 minutes - employee data changes infrequently
-  incidents: 2 * 60 * 1000,       // 2 minutes - incidents change frequently
-  categories: 30 * 60 * 1000,     // 30 minutes - categories rarely change
-  userTickets: 3 * 60 * 1000,     // 3 minutes - user's own tickets
-  searchResults: 1 * 60 * 1000,   // 1 minute - search results are time-sensitive
+  incidents: 15 * 60 * 1000,      // 15 minutes - balanced cache (server-filtered)
+  categories: 60 * 60 * 1000,     // 60 minutes - categories rarely change
+  userTickets: 10 * 60 * 1000,    // 10 minutes - user's own tickets (high priority)
+  searchResults: 5 * 60 * 1000,   // 5 minutes - search results are time-sensitive
+  userTicketsPage: 10 * 60 * 1000, // 10 minutes - paginated user tickets (per page)
+  requestOfferings: 4 * 60 * 60 * 1000, // 4 hours - Request Offerings change infrequently (catalog updates are rare)
+  requestOfferingFieldset: 4 * 60 * 60 * 1000, // 4 hours - Fieldsets rarely change
+  requestOfferingsComplete: 4 * 60 * 60 * 1000, // 4 hours - Complete offerings with fieldsets (pre-fetched knowledge base)
 };
 
 /**
@@ -133,6 +138,35 @@ function isCacheValid<T>(entry: CacheEntry<T> | null): entry is CacheEntry<T> {
   const now = Date.now();
   const age = now - entry.timestamp;
   return age < entry.ttl;
+}
+
+/**
+ * INDUSTRY BEST PRACTICE: Track last sync time for incremental updates
+ * Stores the last time data was fetched for a specific user/resource
+ * Used for "updatedSince" queries to fetch only changed data
+ */
+export async function getLastSyncTime(userId: string, resource: string): Promise<Date | null> {
+  try {
+    const key = `last_sync_${resource}_${userId}`;
+    const result = await chrome.storage.local.get(key);
+    if (result[key]) {
+      return new Date(result[key]);
+    }
+    return null;
+  } catch (error) {
+    console.error('[Cache] Error getting last sync time:', error);
+    return null;
+  }
+}
+
+export async function setLastSyncTime(userId: string, resource: string, time: Date = new Date()): Promise<void> {
+  try {
+    const key = `last_sync_${resource}_${userId}`;
+    await chrome.storage.local.set({ [key]: time.toISOString() });
+    console.log(`[Cache] ✅ Updated last sync time for ${resource}/${userId}: ${time.toISOString()}`);
+  } catch (error) {
+    console.error('[Cache] Error setting last sync time:', error);
+  }
 }
 
 /**
